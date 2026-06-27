@@ -3,6 +3,7 @@ import struct
 import hashlib
 import threading
 import time
+import base64
 from typing import Callable, Dict, Optional, Tuple
 from common.logger import get_logger
 
@@ -113,7 +114,19 @@ class FileTransferReceiver:
     def handle_data(self, params: dict) -> bool:
         transfer_id = params["transfer_id"]
         chunk_index = params["chunk_index"]
-        data = params["data"]
+        data_param = params["data"]
+
+        if isinstance(data_param, str):
+            try:
+                data = base64.b64decode(data_param)
+            except Exception as e:
+                logger.warning(f"Base64 decode error for chunk {chunk_index}: {e}")
+                return False
+        elif isinstance(data_param, bytes):
+            data = data_param
+        else:
+            logger.warning(f"Invalid data type for chunk {chunk_index}: {type(data_param)}")
+            return False
 
         with self._lock:
             transfer = self._active_transfers.get(transfer_id)

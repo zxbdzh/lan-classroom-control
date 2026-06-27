@@ -1,4 +1,4 @@
-import struct
+import base64
 import threading
 import time
 from typing import List, Optional, Callable
@@ -7,9 +7,6 @@ from common.screen_capture import ScreenCapturer
 from common.logger import get_logger
 
 logger = get_logger("screen_broadcast")
-
-FRAME_HEADER_FORMAT = "!II"
-FRAME_HEADER_SIZE = struct.calcsize(FRAME_HEADER_FORMAT)
 
 
 class ScreenBroadcaster:
@@ -88,10 +85,11 @@ class ScreenBroadcaster:
 
     def _broadcast_frame(self, frame_data: bytes, frame_size: tuple):
         width, height = frame_size
+        frame_b64 = base64.b64encode(frame_data).decode('ascii')
         msg = build_message(MessageType.BROADCAST_FRAME, {
             "width": width,
             "height": height,
-            "data_length": len(frame_data)
+            "frame_data": frame_b64
         })
 
         with self._target_lock:
@@ -102,7 +100,6 @@ class ScreenBroadcaster:
                 if not conn.is_alive():
                     continue
                 conn.send_message(msg)
-                conn.send_binary(frame_data)
             except Exception as e:
                 logger.debug(f"Send frame to {conn.addr} failed: {e}")
 

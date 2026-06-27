@@ -2,6 +2,7 @@ import os
 import struct
 import threading
 import uuid
+import base64
 from typing import Callable, Dict, List, Optional
 from common.protocol import MessageType, build_message
 from common.file_transfer import CHUNK_SIZE, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
@@ -75,11 +76,12 @@ class FileDistributor:
                         break
                     header = struct.pack(FILE_HEADER_FORMAT, 1, chunk_index, len(chunk))
                     chunk_data = header + chunk
+                    chunk_b64 = base64.b64encode(chunk_data).decode('ascii')
 
                     data_msg = build_message(MessageType.FILE_SEND_DATA, {
                         "transfer_id": transfer_id,
                         "chunk_index": chunk_index,
-                        "data": chunk_data,
+                        "data": chunk_b64,
                     })
 
                     for student in students:

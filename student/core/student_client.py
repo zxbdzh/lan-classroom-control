@@ -1,6 +1,7 @@
 import socket
 import uuid
 import os
+import base64
 from typing import Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
 from common.tcp_conn import TCPClient
@@ -221,10 +222,15 @@ class StudentClient:
 
     def _handle_broadcast_frame(self, params: dict):
         if self._broadcasting and self.on_screen_frame:
-            frame_data = params.get("frame_data", b"")
+            frame_b64 = params.get("frame_data", "")
             width = params.get("width", 0)
             height = params.get("height", 0)
-            self.on_screen_frame(frame_data, (width, height))
+            if frame_b64 and width > 0 and height > 0:
+                try:
+                    frame_data = base64.b64decode(frame_b64)
+                    self.on_screen_frame(frame_data, (width, height))
+                except Exception as e:
+                    logger.debug(f"Decode frame data error: {e}")
 
     def _handle_net_control(self, params: dict):
         enable = params.get("enable", False)
