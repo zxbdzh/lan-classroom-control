@@ -66,12 +66,44 @@ class StudentClient:
     def _get_mac(self) -> str:
         try:
             import psutil
+            local_ip = self.local_ip
+            target_mac = None
+            first_valid_mac = None
             for name, addrs in psutil.net_if_addrs().items():
+                has_ip = False
+                mac_addr = ""
                 for addr in addrs:
-                    if addr.family == psutil.AF_LINK and addr.address:
-                        return addr.address
-        except Exception:
-            pass
+                    if addr.family == socket.AF_INET and addr.address == local_ip:
+                        has_ip = True
+                    try:
+                        if (addr.family == getattr(psutil, 'AF_LINK', None) or
+                            (hasattr(addr, 'address') and
+                             isinstance(addr.address, str) and
+                             len(addr.address.split(':')) == 6 and
+                             addr.address != '00:00:00:00:00:00')):
+                            if addr.address and addr.address != '00:00:00:00:00:00':
+                                mac_addr = addr.address
+                                if first_valid_mac is None:
+                                    first_valid_mac = mac_addr
+                    except Exception:
+                        pass
+                if has_ip and mac_addr:
+                    target_mac = mac_addr
+                    break
+            if target_mac:
+                return target_mac
+            if first_valid_mac:
+                return first_valid_mac
+        except Exception as e:
+            logger.warning(f"Get MAC via psutil failed: {e}")
+        try:
+            import uuid
+            node = uuid.getnode()
+            mac = ':'.join(['{:02x}'.format((node >> i) & 0xff) for i in range(0, 48, 8)][::-1])
+            if mac != '00:00:00:00:00:00':
+                return mac
+        except Exception as e:
+            logger.warning(f"Get MAC via uuid failed: {e}")
         return "00:00:00:00:00:00"
 
     def _load_or_generate_student_id(self) -> str:
