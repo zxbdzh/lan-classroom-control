@@ -516,7 +516,7 @@ class TeacherMainWindow(QMainWindow):
     def _on_scan_devices(self):
         self.left_tabs.setCurrentIndex(1)
         self.discover_status.setText("正在扫描局域网...")
-        self.server.discover.scan_once()
+        self.server.scan_devices()
         QTimer.singleShot(3000, self._update_discover_status_text)
 
     def _update_discover_status_text(self):
@@ -577,14 +577,11 @@ class TeacherMainWindow(QMainWindow):
 
     def _add_discovered_device(self, info: dict):
         ip = info.get("ip", "")
-        sid = info.get("student_id", "")
         if not ip:
             return
         logger.info(f"Adding discovered device: {info.get('hostname')} ({ip})")
-        if sid in self._discovered_cache:
-            del self._discovered_cache[sid]
-        self._refresh_discover_list()
-        self._update_status_bar()
+        self.server.add_discovered_student(info)
+        self.discover_status.setText(f"已请求 {info.get('hostname')} 连接，请稍候...")
 
     def closeEvent(self, event):
         reply = QMessageBox.question(

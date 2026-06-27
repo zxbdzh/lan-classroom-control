@@ -236,3 +236,12 @@ class TeacherServer:
 
     def get_discovered_students(self) -> List[dict]:
         return self.discover.get_discovered_students()
+
+    def add_discovered_student(self, info: dict):
+        ip = info.get("ip", "")
+        if ip:
+            self.discover.send_discover_to(ip)
+            logger.info(f"Adding discovered student: {info.get('hostname')} ({ip})")
+
+    def scan_devices(self):
+        self.discover.scan_once()

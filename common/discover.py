@@ -44,7 +44,9 @@ def get_local_interfaces() -> List[Dict]:
 
 class TeacherDiscover:
     def __init__(self, broadcast_port: int = 9527, tcp_port: int = 9528,
-                 broadcast_interval: float = 3.0):
+                 broadcast_interval: float = 3.0,
+                 student_timeout: float = 15.0,
+                 cleanup_interval: float = 3.0):
         self.broadcast_port = broadcast_port
         self.tcp_port = tcp_port
         self.broadcast_interval = broadcast_interval
@@ -55,7 +57,8 @@ class TeacherDiscover:
         self._listen_sock = None
         self._discovered_students: Dict[str, dict] = {}
         self._discovered_lock = threading.Lock()
-        self._student_timeout = 15.0
+        self._student_timeout = student_timeout
+        self._cleanup_interval = cleanup_interval
         self.on_student_discovered: Optional[Callable] = None
         self.on_student_lost: Optional[Callable] = None
 
@@ -113,21 +116,8 @@ class TeacherDiscover:
         return targets
 
     def _broadcast_loop(self):
-        msg = build_message(MessageType.TEACHER_DISCOVER, {
-            "tcp_port": self.tcp_port,
-            "teacher_name": socket.gethostname()
-        })
-        data = serialize_message(msg)
         while self._running:
-            try:
-                targets = self._get_broadcast_targets()
-                for target in targets:
-                    try:
-                        self._send_sock.sendto(data, (target, self.broadcast_port))
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.debug(f"Broadcast send error: {e}")
+            self._send_broadcast()
             time.sleep(self.broadcast_interval)
 
     def _listen_loop(self):
@@ -181,7 +171,7 @@ class TeacherDiscover:
 
     def _cleanup_loop(self):
         while self._running:
-            time.sleep(3.0)
+            time.sleep(self._cleanup_interval)
             now = time.time()
             expired = []
             with self._discovered_lock:
@@ -202,6 +192,36 @@ class TeacherDiscover:
         interfaces = get_local_interfaces()
         logger.info(f"Scanning on {len(interfaces)} interfaces: "
                      f"{[i['name'] for i in interfaces]}")
+        self._send_broadcast()
+
+    def _send_broadcast(self):
+        try:
+            msg = build_message(MessageType.TEACHER_DISCOVER, {
+                "tcp_port": self.tcp_port,
+                "teacher_name": socket.gethostname()
+            })
+            data = serialize_message(msg)
+            targets = self._get_broadcast_targets()
+            for target in targets:
+                try:
+                    self._send_sock.sendto(data, (target, self.broadcast_port))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Broadcast send error: {e}")
+
+    def send_discover_to(self, ip: str):
+        try:
+            msg = build_message(MessageType.TEACHER_DISCOVER, {
+                "tcp_port": self.tcp_port,
+                "teacher_name": socket.gethostname()
+            })
+            data = serialize_message(msg)
+            if self._send_sock:
+                self._send_sock.sendto(data, (ip, self.broadcast_port))
+                logger.info(f"Sent discover to {ip}")
+        except Exception as e:
+            logger.error(f"Send discover to {ip} error: {e}")
 
 
 class StudentDiscoverListener:
