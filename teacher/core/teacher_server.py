@@ -8,6 +8,7 @@ from common.logger import get_logger
 from teacher.core.student_manager import StudentManager, StudentInfo
 from teacher.core.screen_broadcast import ScreenBroadcaster
 from teacher.core.file_distributor import FileDistributor
+from teacher.core.update_server import UpdateServer
 
 logger = get_logger("teacher_core")
 
@@ -26,6 +27,7 @@ class TeacherServer:
         self.student_manager = StudentManager()
         self.screen_broadcaster = ScreenBroadcaster(fps=20, quality=70)
         self.file_distributor = FileDistributor()
+        self.update_server = UpdateServer(self.student_manager, self.file_distributor)
 
         self.on_student_added: Optional[Callable] = None
         self.on_student_removed: Optional[Callable] = None
@@ -75,6 +77,10 @@ class TeacherServer:
                 self._handle_heartbeat(conn, params)
             elif msg_type == MessageType.FILE_SEND_ACK:
                 self._handle_file_ack(params)
+            elif msg_type == MessageType.UPDATE_REQUEST:
+                self.update_server.on_update_request(conn, params)
+            elif msg_type == MessageType.UPDATE_PROGRESS:
+                self.update_server.on_update_progress(conn, params)
         except Exception as e:
             logger.error(f"Handle message error from {conn.addr}: {e}")
 
@@ -113,6 +119,14 @@ class TeacherServer:
         self.student_manager.add_student(student)
         self.heartbeat_manager.register_student(student_id)
         logger.info(f"Student registered: {hostname} ({ip}) [{mac}]")
+
+        # 学生注册成功后，如果有待推送的更新包，自动通知新注册的学生
+        # 覆盖离线重连后补更新场景
+        if self.update_server.update_file_path and self.update_server.update_version:
+            try:
+                self.update_server.notify_update([student_id])
+            except Exception as e:
+                logger.warning(f"Auto notify update to {hostname} failed: {e}")
 
     def _handle_heartbeat(self, conn: TCPConnection, params: dict):
         if conn.student_id:
@@ -225,6 +239,25 @@ class TeacherServer:
         return self.file_distributor.send_file_to_students(
             file_path, students, progress_callback
         )
+
+    def push_update(self, file_path: str, version: str,
+                    student_ids: Optional[List[str]] = None) -> int:
+        """设置更新包并向学生端通知有新版本。
+
+        Args:
+            file_path: 更新包 zip 文件路径
+            version: 新版本号
+            student_ids: 指定学生 ID 列表，None 表示所有在线学生
+
+        Returns: 通知到的学生数量
+        """
+        if not self.update_server.set_update_package(file_path, version):
+            return 0
+        return self.update_server.notify_update(student_ids)
+
+    def get_update_progress(self) -> dict:
+        """获取各学生端的更新进度。"""
+        return self.update_server.get_update_progress()
 
     def _on_discovered_student(self, info: dict):
         if self.on_discovered_student:

@@ -68,6 +68,8 @@ class ScreenCapturer:
                 start_time = time.time()
                 try:
                     raw = sct.grab(monitor_info)
+                    if not raw or not raw.rgb:
+                        continue
                     img = Image.frombytes("RGB", raw.size, raw.rgb)
                     jpeg_data = self._compress_frame(img)
                     with self._frame_lock:

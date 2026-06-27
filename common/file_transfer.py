@@ -98,6 +98,14 @@ class FileTransferReceiver:
         md5 = params.get("md5", "")
 
         save_path = os.path.join(self.save_dir, file_name)
+        # 文件名冲突自动加序号 (1), (2)...
+        if os.path.exists(save_path):
+            base, ext = os.path.splitext(file_name)
+            i = 1
+            while os.path.exists(os.path.join(self.save_dir, f"{base}({i}){ext}")):
+                i += 1
+            save_path = os.path.join(self.save_dir, f"{base}({i}){ext}")
+            logger.info(f"File name conflict, renamed to: {os.path.basename(save_path)}")
         with self._lock:
             self._active_transfers[transfer_id] = {
                 "file_name": file_name,
@@ -109,7 +117,7 @@ class FileTransferReceiver:
                 "start_time": time.time(),
                 "file": open(save_path, "wb"),
             }
-        logger.info(f"Receiving file: {file_name}, size: {file_size}")
+        logger.info(f"Receiving file: {file_name}, size: {file_size}, save to: {save_path}")
 
     def handle_data(self, params: dict) -> bool:
         transfer_id = params["transfer_id"]

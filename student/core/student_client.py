@@ -2,6 +2,7 @@ import socket
 import uuid
 import os
 import base64
+import threading
 from typing import Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
 from common.tcp_conn import TCPClient
@@ -9,8 +10,11 @@ from common.discover import StudentDiscoverListener
 from common.heartbeat import StudentHeartbeatSender
 from common.logger import get_logger
 from common.config import get_config
+from common.version import get_version
 from student.core.input_blocker import InputBlocker
 from student.core.net_control import NetController
+from student.core.update_client import UpdateClient
+from student.core import autostart
 from common.file_transfer import FileTransferReceiver
 
 logger = get_logger("student_core")
@@ -30,15 +34,16 @@ class StudentClient:
             student_id=self.student_id,
             hostname=self.hostname,
             mac=self.mac_address,
-            version="1.0.0"
+            version=get_version()
         )
         self.heartbeat_sender = StudentHeartbeatSender(interval=5)
         self.input_blocker = InputBlocker()
         self.net_controller = NetController()
 
         if save_dir is None:
-            save_dir = os.path.join(os.path.expanduser("~"), "Downloads", "LanClassroom")
+            save_dir = self._get_default_save_dir()
         self.file_receiver = FileTransferReceiver(save_dir)
+        self.update_client = UpdateClient(self.tcp_client.send_message)
 
         self._black_screen = False
         self._broadcasting = False
@@ -49,10 +54,28 @@ class StudentClient:
         self.on_broadcast_stopped: Optional[Callable] = None
         self.on_screen_frame: Optional[Callable] = None
         self.on_file_received: Optional[Callable] = None
+        self.on_file_progress: Optional[Callable] = None
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
+        self.on_update_state: Optional[Callable] = None
+
+        # 启动时确保开机自启已开启
+        try:
+            autostart.ensure_autostart()
+        except Exception as e:
+            logger.warning(f"Ensure autostart failed: {e}")
 
         self._setup_callbacks()
+
+    def _get_default_save_dir(self) -> str:
+        """获取桌面路径，fallback到Downloads"""
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if os.path.isdir(desktop):
+            return desktop
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.isdir(downloads):
+            return os.path.join(downloads, "LanClassroom")
+        return os.path.expanduser("~")
 
     def _get_local_ip(self) -> str:
         try:
@@ -146,7 +169,7 @@ class StudentClient:
             "hostname": self.hostname,
             "ip": self.local_ip,
             "mac": self.mac_address,
-            "version": "1.0.0"
+            "version": get_version()
         })
         self.tcp_client.send_message(register_msg)
         self.heartbeat_sender.start(self.tcp_client.send_message)
@@ -190,6 +213,8 @@ class StudentClient:
                 self._handle_file_data(params)
             elif msg_type == MessageType.FILE_SEND_END:
                 self._handle_file_end(params)
+            elif msg_type == MessageType.UPDATE_CHECK:
+                self._handle_update_check(params)
             elif msg_type == MessageType.STUDENT_HEARTBEAT:
                 pass
         except Exception as e:
@@ -215,7 +240,8 @@ class StudentClient:
 
     def _handle_broadcast_stop(self, params: dict):
         self._broadcasting = False
-        self.input_blocker.unblock()
+        # 异步解除键鼠禁用，避免 pynput stop 阻塞主线程（Win7上较慢）
+        threading.Thread(target=self.input_blocker.unblock, daemon=True).start()
         if self.on_broadcast_stopped:
             self.on_broadcast_stopped()
         logger.info("Broadcast stopped")
@@ -243,12 +269,32 @@ class StudentClient:
         logger.info(f"Net control: {enable}")
 
     def _handle_file_start(self, params: dict):
+        # 更新包走 update_client，普通文件走 file_receiver
+        if params.get("is_update", False):
+            self.update_client.handle_start(params)
+            return
         self.file_receiver.handle_start(params)
+        if self.on_file_progress:
+            self.on_file_progress(params.get("file_name", ""), 0.0, params.get("file_size", 0))
 
     def _handle_file_data(self, params: dict):
+        # 判断当前 transfer_id 属于哪个接收器
+        if self.update_client._active_transfer and \
+                self.update_client._active_transfer.get("transfer_id") == params.get("transfer_id", ""):
+            self.update_client.handle_data(params)
+            return
         self.file_receiver.handle_data(params)
+        if self.on_file_progress:
+            transfer_id = params.get("transfer_id", "")
+            progress = self.file_receiver.get_progress(transfer_id)
+            self.on_file_progress("", progress, 1.0)
 
     def _handle_file_end(self, params: dict):
+        # 更新包的结束处理会触发自动重启
+        if self.update_client._active_transfer and \
+                self.update_client._active_transfer.get("transfer_id") == params.get("transfer_id", ""):
+            self.update_client.handle_end(params)
+            return
         success, result = self.file_receiver.handle_end(params)
         if success and self.on_file_received:
             self.on_file_received(result)
@@ -258,6 +304,10 @@ class StudentClient:
             "result": result if success else str(result)
         })
         self.tcp_client.send_message(ack_msg)
+
+    def _handle_update_check(self, params: dict):
+        """收到教师端的更新通知，对比版本后自动请求下载。"""
+        self.update_client.check_and_request(params)
 
     @property
     def is_black_screen(self) -> bool:

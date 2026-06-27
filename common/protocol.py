@@ -22,6 +22,9 @@ class MessageType(Enum):
     FILE_SEND_ACK = "file_send_ack"
     COMMAND_ACK = "command_ack"
     STUDENT_STATUS = "student_status"
+    UPDATE_CHECK = "update_check"          # 教师端→学生端：通知有新版本
+    UPDATE_REQUEST = "update_request"      # 学生端→教师端：请求下载更新包
+    UPDATE_PROGRESS = "update_progress"    # 学生端→教师端：上报更新进度
 
 
 PROTOCOL_VERSION = "1.0"

@@ -213,6 +213,10 @@ class TeacherMainWindow(QMainWindow):
         action_send_file.triggered.connect(self._on_send_file)
         toolbar.addAction(action_send_file)
 
+        action_push_update = QAction("推送更新", self)
+        action_push_update.triggered.connect(self._on_push_update)
+        toolbar.addAction(action_push_update)
+
         toolbar.addSeparator()
 
         action_scan = QAction("扫描设备", self)
@@ -507,6 +511,44 @@ class TeacherMainWindow(QMainWindow):
         else:
             self.server.send_file(file_path, sids)
         QMessageBox.information(self, "发送文件", "文件已开始发送")
+
+    def _on_push_update(self):
+        # 1. 选择更新包 zip
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择更新包", "", "更新包 (*.zip);;所有文件 (*)"
+        )
+        if not file_path:
+            return
+        # 2. 输入版本号
+        version, ok = QInputDialog.getText(
+            self, "推送更新", "请输入新版本号:", text="1.0.8"
+        )
+        if not ok or not version.strip():
+            return
+        version = version.strip()
+        # 3. 确认推送范围
+        sids = self._get_selected_student_ids()
+        if not sids:
+            reply = QMessageBox.question(
+                self, "推送更新",
+                f"未选择学生，是否推送给全体在线学生？\n版本: {version}\n文件: {file_path}"
+            )
+            if reply != QMessageBox.Yes:
+                return
+            count = self.server.push_update(file_path, version)
+        else:
+            reply = QMessageBox.question(
+                self, "推送更新",
+                f"确认向选中的 {len(sids)} 名学生推送更新？\n版本: {version}\n文件: {file_path}"
+            )
+            if reply != QMessageBox.Yes:
+                return
+            count = self.server.push_update(file_path, version, sids)
+        QMessageBox.information(
+            self, "推送更新",
+            f"已通知 {count} 名学生有新版本 {version}\n"
+            f"学生端会自动下载并安装重启。"
+        )
 
     def _update_status_bar(self):
         online = self.server.student_manager.online_count()

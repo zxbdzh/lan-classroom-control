@@ -19,7 +19,9 @@ class FileDistributor:
         self.on_complete: Optional[Callable] = None
 
     def send_file_to_students(self, file_path: str, students: List,
-                              progress_callback: Optional[Callable] = None) -> str:
+                              progress_callback: Optional[Callable] = None,
+                              is_update: bool = False,
+                              target_version: str = "") -> str:
         transfer_id = str(uuid.uuid4())
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
@@ -38,7 +40,8 @@ class FileDistributor:
         thread = threading.Thread(
             target=self._send_file_worker,
             args=(transfer_id, file_path, file_name, file_size,
-                  total_chunks, md5_hex, students, progress_callback),
+                  total_chunks, md5_hex, students, progress_callback,
+                  is_update, target_version),
             daemon=True
         )
         thread.start()
@@ -50,20 +53,26 @@ class FileDistributor:
                 "file_size": file_size,
                 "students": len(students),
                 "thread": thread,
+                "is_update": is_update,
             }
         return transfer_id
 
     def _send_file_worker(self, transfer_id: str, file_path: str, file_name: str,
                           file_size: int, total_chunks: int, md5_hex: str,
-                          students: List, progress_callback: Optional[Callable]):
+                          students: List, progress_callback: Optional[Callable],
+                          is_update: bool = False, target_version: str = ""):
         try:
-            start_msg = build_message(MessageType.FILE_SEND_START, {
+            start_params = {
                 "transfer_id": transfer_id,
                 "file_name": file_name,
                 "file_size": file_size,
                 "total_chunks": total_chunks,
                 "md5": md5_hex,
-            })
+            }
+            if is_update:
+                start_params["is_update"] = True
+                start_params["target_version"] = target_version
+            start_msg = build_message(MessageType.FILE_SEND_START, start_params)
             for student in students:
                 if student.conn and student.conn.is_alive():
                     student.conn.send_message(start_msg)

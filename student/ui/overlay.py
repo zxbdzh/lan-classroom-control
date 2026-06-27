@@ -4,6 +4,9 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
 from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPalette
 from io import BytesIO
 from PIL import Image
+from common.logger import get_logger
+
+logger = get_logger("overlay")
 
 
 class OverlayWindow(QWidget):
@@ -13,6 +16,8 @@ class OverlayWindow(QWidget):
         super().__init__()
         self._setup_ui()
         self._current_pixmap = None
+        self._active = False  # 是否正在接收帧
+        self._frame_data_ref = None  # 持有帧数据引用，防止Qt底层指针悬空
         self.frame_received.connect(self._on_frame_received)
 
     def _setup_ui(self):
@@ -43,6 +48,7 @@ class OverlayWindow(QWidget):
         self._message_label.hide()
 
     def show_black_screen(self):
+        self._active = False
         self._label.setText("")
         self._label.setStyleSheet("background-color: black;")
         self._message_label.setText("")
@@ -52,6 +58,7 @@ class OverlayWindow(QWidget):
         self.activateWindow()
 
     def show_broadcast(self):
+        self._active = True
         self._message_label.setText("正在连接教师屏幕...")
         self._message_label.show()
         self._label.setStyleSheet("background-color: #111;")
@@ -60,28 +67,39 @@ class OverlayWindow(QWidget):
         self.activateWindow()
 
     def hide_overlay(self):
-        self.hide()
+        self._active = False
+        self._current_pixmap = None
+        self._frame_data_ref = None
+        self._label.clear()
+        # 延迟隐藏，让积压的帧先被丢弃
+        QTimer.singleShot(200, self.hide)
 
     def update_frame(self, frame_data: bytes, size: tuple):
         self.frame_received.emit(frame_data, size)
 
     def _on_frame_received(self, frame_data: bytes, size: tuple):
+        if not self._active:
+            return
         try:
             img = Image.open(BytesIO(frame_data))
+            img = img.convert("RGB")
+            data = img.tobytes("raw", "RGB")
             qimg = QImage(
-                img.tobytes(),
+                data,
                 img.width,
                 img.height,
                 img.width * 3,
                 QImage.Format_RGB888
             )
+            # 必须持有 data 引用，否则 QImage 底层数据会被回收
+            self._frame_data_ref = data
             pixmap = QPixmap.fromImage(qimg)
             self._current_pixmap = pixmap
             self._update_display()
             if self._message_label.isVisible():
                 self._message_label.hide()
         except Exception as e:
-            pass
+            logger.warning(f"Frame decode error: {e}")
 
     def _update_display(self):
         if self._current_pixmap:

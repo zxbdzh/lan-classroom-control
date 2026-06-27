@@ -20,6 +20,7 @@ class StudentAppUI(QObject):
     broadcast_stopped = pyqtSignal()
     screen_frame = pyqtSignal(bytes, tuple)
     file_received = pyqtSignal(str)
+    file_progress = pyqtSignal(str, float, float)  # file_name, progress(0-1), total_bytes
     status_changed = pyqtSignal(str)
 
     def __init__(self):
@@ -51,6 +52,7 @@ class StudentAppUI(QObject):
 
         self._setup_tray()
         self._setup_client_callbacks()
+        self._check_admin_warning()
 
     def _setup_signals(self):
         self.black_screen_changed.connect(self._on_black_screen_changed_ui)
@@ -58,6 +60,7 @@ class StudentAppUI(QObject):
         self.broadcast_stopped.connect(self._on_broadcast_stopped_ui)
         self.screen_frame.connect(self._on_screen_frame_ui)
         self.file_received.connect(self._on_file_received_ui)
+        self.file_progress.connect(self._on_file_progress_ui)
         self.status_changed.connect(self._on_status_changed_ui)
 
     def _setup_client_callbacks(self):
@@ -67,8 +70,27 @@ class StudentAppUI(QObject):
             self.client.on_broadcast_stopped = lambda: self.broadcast_stopped.emit()
             self.client.on_screen_frame = lambda data, size: self.screen_frame.emit(data, size)
             self.client.on_file_received = lambda path: self.file_received.emit(path)
+            self.client.on_file_progress = lambda name, progress, total: self.file_progress.emit(name, progress, total)
             self.client.on_connected = lambda: self.status_changed.emit("已连接教师端")
             self.client.on_disconnected = lambda: self.status_changed.emit("未连接")
+
+    def _check_admin_warning(self):
+        if not self.client:
+            return
+        if sys.platform == "win32":
+            has_admin = self.client.net_controller.check_admin_privilege()
+            if not has_admin:
+                logger.warning("Student running without administrator privilege")
+                try:
+                    if self.tray and QSystemTrayIcon.supportsMessages():
+                        self.tray.showMessage(
+                            "提示",
+                            "当前未以管理员身份运行，禁用上网等功能可能无法正常工作。\n建议右键选择'以管理员身份运行'。",
+                            QSystemTrayIcon.Information,
+                            5000
+                        )
+                except Exception:
+                    pass
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -81,9 +103,11 @@ class StudentAppUI(QObject):
 
         menu = QMenu()
         self._status_action = menu.addAction("状态: 等待连接")
+        self._status_action.setEnabled(False)
         menu.addSeparator()
-        quit_action = menu.addAction("退出")
-        quit_action.triggered.connect(self._on_quit)
+        about_action = menu.addAction("关于")
+        about_action.triggered.connect(self._on_about)
+        # 学生端不允许通过托盘退出，移除"退出"选项
 
         self.tray.setContextMenu(menu)
         self.tray.show()
@@ -154,20 +178,41 @@ class StudentAppUI(QObject):
             try:
                 self.tray.showMessage(
                     "文件接收完成",
-                    f"文件已保存到: {file_path}",
+                    f"文件已保存到桌面: {os.path.basename(file_path)}",
                     QSystemTrayIcon.Information,
                     5000
                 )
             except Exception as e:
                 logger.warning(f"Tray message error: {e}")
 
-    def _on_quit(self):
+    def _on_file_progress_ui(self, file_name: str, progress: float, total: float):
+        if not (self.tray and QSystemTrayIcon.supportsMessages()):
+            return
         try:
-            if self.client:
-                self.client.stop()
+            percent = int(progress * 100)
+            # 进度通知只在整十的百分比或开始时显示，避免刷屏
+            if percent % 10 == 0 or percent < 5:
+                display_name = file_name if file_name else "文件"
+                self.tray.showMessage(
+                    "文件接收中",
+                    f"{display_name} {percent}%",
+                    QSystemTrayIcon.Information,
+                    1500
+                )
         except Exception as e:
-            logger.error(f"Error stopping client: {e}")
-        self.app.quit()
+            logger.debug(f"Progress tray message error: {e}")
+
+    def _on_about(self):
+        from common.version import get_version
+        QMessageBox.information(
+            None, "关于",
+            f"局域网机房控制系统 - 学生端\n版本: {get_version()}\n\n"
+            f"本程序由教师端统一管理，开机自启动。"
+        )
+
+    def _on_quit(self):
+        # 学生端不允许退出，此方法仅作内部兜底
+        logger.warning("Student quit attempted, but student app is not allowed to quit")
 
     def run(self):
         try:

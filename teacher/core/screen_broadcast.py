@@ -79,11 +79,17 @@ class ScreenBroadcaster:
             except Exception as e:
                 logger.debug(f"Broadcast frame error: {e}")
             elapsed = time.time() - start_time
-            sleep_time = frame_interval - elapsed
+            # 帧率自适应：目标多时自动降帧
+            with self._target_lock:
+                target_count = len(self._target_connections)
+            effective_interval = frame_interval * (1.5 if target_count > 5 else 1.0)
+            sleep_time = effective_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
     def _broadcast_frame(self, frame_data: bytes, frame_size: tuple):
+        if not frame_data or len(frame_data) < 100:
+            return
         width, height = frame_size
         frame_b64 = base64.b64encode(frame_data).decode('ascii')
         msg = build_message(MessageType.BROADCAST_FRAME, {

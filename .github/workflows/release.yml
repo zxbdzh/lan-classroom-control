@@ -34,6 +34,7 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Teacher `
             --add-data "common;common" `
+            --add-data "version.txt;." `
             --hidden-import PyQt5 `
             --hidden-import PyQt5.QtCore `
             --hidden-import PyQt5.QtGui `
@@ -52,6 +53,7 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Student `
             --add-data "common;common" `
+            --add-data "version.txt;." `
             --hidden-import PyQt5 `
             --hidden-import PyQt5.QtCore `
             --hidden-import PyQt5.QtGui `
