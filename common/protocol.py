@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 class MessageType(Enum):
     STUDENT_REGISTER = "student_register"
     STUDENT_HEARTBEAT = "student_heartbeat"
+    STUDENT_ANNOUNCE = "student_announce"
     TEACHER_DISCOVER = "teacher_discover"
     BLACK_SCREEN = "black_screen"
     BROADCAST_START = "broadcast_start"

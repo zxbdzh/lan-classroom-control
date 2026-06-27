@@ -25,7 +25,11 @@ class StudentClient:
 
         self.tcp_client = TCPClient()
         self.discover_listener = StudentDiscoverListener(
-            on_discover_callback=self._on_teacher_discovered
+            on_discover_callback=self._on_teacher_discovered,
+            student_id=self.student_id,
+            hostname=self.hostname,
+            mac=self.mac_address,
+            version="1.0.0"
         )
         self.heartbeat_sender = StudentHeartbeatSender(interval=5)
         self.input_blocker = InputBlocker()

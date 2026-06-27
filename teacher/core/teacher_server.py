@@ -30,6 +30,8 @@ class TeacherServer:
         self.on_student_added: Optional[Callable] = None
         self.on_student_removed: Optional[Callable] = None
         self.on_student_changed: Optional[Callable] = None
+        self.on_discovered_student: Optional[Callable] = None
+        self.on_discovered_lost: Optional[Callable] = None
 
         self._setup_callbacks()
 
@@ -43,6 +45,9 @@ class TeacherServer:
         self.student_manager.on_student_added = self._forward_student_added
         self.student_manager.on_student_removed = self._forward_student_removed
         self.student_manager.on_student_changed = self._forward_student_changed
+
+        self.discover.on_student_discovered = self._on_discovered_student
+        self.discover.on_student_lost = self._on_discovered_lost
 
     def start(self):
         self.tcp_server.start()
@@ -220,3 +225,14 @@ class TeacherServer:
         return self.file_distributor.send_file_to_students(
             file_path, students, progress_callback
         )
+
+    def _on_discovered_student(self, info: dict):
+        if self.on_discovered_student:
+            self.on_discovered_student(info)
+
+    def _on_discovered_lost(self, info: dict):
+        if self.on_discovered_lost:
+            self.on_discovered_lost(info)
+
+    def get_discovered_students(self) -> List[dict]:
+        return self.discover.get_discovered_students()

@@ -2,11 +2,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QLabel, QStatusBar, QFileDialog, QMessageBox, QMenu, QInputDialog,
-    QGridLayout, QScrollArea, QFrame
+    QGridLayout, QScrollArea, QFrame, QPushButton, QTabWidget, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize
 from PyQt6.QtGui import QAction, QIcon, QPixmap, QFont, QColor, QBrush
-from typing import List, Optional
+from typing import List, Optional, Dict
 from teacher.core.teacher_server import TeacherServer
 from teacher.core.student_manager import StudentInfo
 from common.logger import get_logger
@@ -83,6 +83,7 @@ class TeacherMainWindow(QMainWindow):
         self.server = TeacherServer()
         self._selected_students = set()
         self._thumb_widgets = {}
+        self._discovered_cache: Dict[str, dict] = {}
         self._setup_ui()
         self._setup_callbacks()
         self.server.start()
@@ -128,6 +129,35 @@ class TeacherMainWindow(QMainWindow):
             }
             QListWidget::item:selected, QTreeWidget::item:selected {
                 background: #0078d4;
+            }
+            QTabWidget::pane {
+                border: 1px solid #333;
+                background: #252525;
+            }
+            QTabBar::tab {
+                background: #2d2d2d;
+                color: #aaa;
+                padding: 8px 16px;
+                border: 1px solid #333;
+                border-bottom: none;
+            }
+            QTabBar::tab:selected {
+                background: #252525;
+                color: #fff;
+            }
+            QPushButton {
+                background: #0078d4;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background: #1086e0;
+            }
+            QPushButton:disabled {
+                background: #555;
+                color: #888;
             }
             QStatusBar {
                 background: #2d2d2d;
@@ -182,16 +212,29 @@ class TeacherMainWindow(QMainWindow):
         action_send_file.triggered.connect(self._on_send_file)
         toolbar.addAction(action_send_file)
 
+        toolbar.addSeparator()
+
+        action_scan = QAction("扫描设备", self)
+        action_scan.triggered.connect(self._on_scan_devices)
+        toolbar.addAction(action_scan)
+
     def _create_central_widget(self):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+
+        self.left_tabs = QTabWidget()
+
+        student_tab = QWidget()
+        student_layout = QVBoxLayout(student_tab)
+        student_layout.setContentsMargins(4, 4, 4, 4)
 
         title = QLabel("学生列表")
         title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
-        left_layout.addWidget(title)
+        student_layout.addWidget(title)
 
         self.student_tree = QTreeWidget()
         self.student_tree.setHeaderLabels(["学生", "状态"])
@@ -199,7 +242,39 @@ class TeacherMainWindow(QMainWindow):
         self.student_tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.student_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.student_tree.customContextMenuRequested.connect(self._on_student_context_menu)
-        left_layout.addWidget(self.student_tree)
+        student_layout.addWidget(self.student_tree)
+
+        self.left_tabs.addTab(student_tab, "学生列表")
+
+        discover_tab = QWidget()
+        discover_layout = QVBoxLayout(discover_tab)
+        discover_layout.setContentsMargins(4, 4, 4, 4)
+        discover_layout.setSpacing(6)
+
+        discover_header = QHBoxLayout()
+        discover_title = QLabel("待添加设备")
+        discover_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
+        discover_header.addWidget(discover_title)
+        discover_header.addStretch()
+        self.btn_add_selected = QPushButton("添加选中")
+        self.btn_add_selected.clicked.connect(self._on_add_selected_devices)
+        self.btn_add_selected.setEnabled(False)
+        discover_header.addWidget(self.btn_add_selected)
+        discover_layout.addLayout(discover_header)
+
+        self.discover_list = QListWidget()
+        self.discover_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.discover_list.itemSelectionChanged.connect(self._on_discover_selection_changed)
+        self.discover_list.itemDoubleClicked.connect(self._on_discover_double_click)
+        discover_layout.addWidget(self.discover_list)
+
+        self.discover_status = QLabel("扫描中...")
+        self.discover_status.setStyleSheet("color: #888; font-size: 11px;")
+        discover_layout.addWidget(self.discover_status)
+
+        self.left_tabs.addTab(discover_tab, "扫描设备")
+
+        left_layout.addWidget(self.left_tabs)
 
         splitter.addWidget(left_panel)
         splitter.setStretchFactor(0, 1)
@@ -238,8 +313,14 @@ class TeacherMainWindow(QMainWindow):
         self.server.on_student_added = self._on_student_added
         self.server.on_student_removed = self._on_student_removed
         self.server.on_student_changed = self._on_student_changed
+        self.server.on_discovered_student = self._on_discovered_student
+        self.server.on_discovered_lost = self._on_discovered_lost
 
     def _on_student_added(self, student: StudentInfo):
+        sid = student.student_id
+        if sid in self._discovered_cache:
+            del self._discovered_cache[sid]
+            self._refresh_discover_list()
         self._refresh_student_list()
         self._refresh_screen_wall()
         self._update_status_bar()
@@ -429,7 +510,81 @@ class TeacherMainWindow(QMainWindow):
     def _update_status_bar(self):
         online = self.server.student_manager.online_count()
         total = self.server.student_manager.count()
-        self.status_label.setText(f"在线学生: {online} / 总数: {total}")
+        discovered = len(self._discovered_cache)
+        self.status_label.setText(f"在线学生: {online} / 总数: {total} | 发现设备: {discovered}")
+
+    def _on_scan_devices(self):
+        self.left_tabs.setCurrentIndex(1)
+        self.discover_status.setText("正在扫描局域网...")
+        self.server.discover.scan_once()
+        QTimer.singleShot(3000, self._update_discover_status_text)
+
+    def _update_discover_status_text(self):
+        count = len(self._discovered_cache)
+        self.discover_status.setText(f"已发现 {count} 台设备")
+
+    def _on_discovered_student(self, info: dict):
+        sid = info.get("student_id", "")
+        if not sid:
+            return
+        if self.server.student_manager.get_student(sid):
+            return
+        self._discovered_cache[sid] = info
+        self._refresh_discover_list()
+        self._update_status_bar()
+
+    def _on_discovered_lost(self, info: dict):
+        sid = info.get("student_id", "")
+        if sid in self._discovered_cache:
+            del self._discovered_cache[sid]
+            self._refresh_discover_list()
+            self._update_status_bar()
+
+    def _refresh_discover_list(self):
+        self.discover_list.clear()
+        for info in self._discovered_cache.values():
+            hostname = info.get("hostname", "unknown")
+            ip = info.get("ip", "")
+            mac = info.get("mac", "")
+            item = QListWidgetItem(f"{hostname}  ({ip})")
+            item.setData(Qt.ItemDataRole.UserRole, info)
+            item.setToolTip(f"主机名: {hostname}\nIP: {ip}\nMAC: {mac}")
+            self.discover_list.addItem(item)
+        count = len(self._discovered_cache)
+        self.discover_status.setText(f"已发现 {count} 台设备")
+
+    def _on_discover_selection_changed(self):
+        items = self.discover_list.selectedItems()
+        self.btn_add_selected.setEnabled(len(items) > 0)
+
+    def _on_discover_double_click(self, item):
+        info = item.data(Qt.ItemDataRole.UserRole)
+        if info:
+            self._add_discovered_device(info)
+
+    def _on_add_selected_devices(self):
+        items = self.discover_list.selectedItems()
+        if not items:
+            return
+        added = 0
+        for item in items:
+            info = item.data(Qt.ItemDataRole.UserRole)
+            if info:
+                self._add_discovered_device(info)
+                added += 1
+        if added > 0:
+            QMessageBox.information(self, "添加设备", f"已添加 {added} 台设备")
+
+    def _add_discovered_device(self, info: dict):
+        ip = info.get("ip", "")
+        sid = info.get("student_id", "")
+        if not ip:
+            return
+        logger.info(f"Adding discovered device: {info.get('hostname')} ({ip})")
+        if sid in self._discovered_cache:
+            del self._discovered_cache[sid]
+        self._refresh_discover_list()
+        self._update_status_bar()
 
     def closeEvent(self, event):
         reply = QMessageBox.question(
