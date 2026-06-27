@@ -92,6 +92,10 @@ class TeacherServer:
         mac = params.get("mac", "")
         version = params.get("version", "")
 
+        existing_by_mac = self.student_manager.find_by_mac(mac) if mac else None
+        if existing_by_mac and existing_by_mac.student_id != student_id:
+            student_id = existing_by_mac.student_id
+
         conn.student_id = student_id
         student = StudentInfo(
             student_id=student_id,
@@ -103,7 +107,7 @@ class TeacherServer:
         )
         self.student_manager.add_student(student)
         self.heartbeat_manager.register_student(student_id)
-        logger.info(f"Student registered: {hostname} ({ip})")
+        logger.info(f"Student registered: {hostname} ({ip}) [{mac}]")
 
     def _handle_heartbeat(self, conn: TCPConnection, params: dict):
         if conn.student_id:

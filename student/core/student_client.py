@@ -7,6 +7,7 @@ from common.tcp_conn import TCPClient
 from common.discover import StudentDiscoverListener
 from common.heartbeat import StudentHeartbeatSender
 from common.logger import get_logger
+from common.config import get_config
 from student.core.input_blocker import InputBlocker
 from student.core.net_control import NetController
 from common.file_transfer import FileTransferReceiver
@@ -16,7 +17,8 @@ logger = get_logger("student_core")
 
 class StudentClient:
     def __init__(self, save_dir: str = None):
-        self.student_id = str(uuid.uuid4())
+        self.config = get_config()
+        self.student_id = self._load_or_generate_student_id()
         self.hostname = socket.gethostname()
         self.local_ip = self._get_local_ip()
         self.mac_address = self._get_mac()
@@ -67,6 +69,15 @@ class StudentClient:
         except Exception:
             pass
         return "00:00:00:00:00:00"
+
+    def _load_or_generate_student_id(self) -> str:
+        saved_id = self.config.get("student.student_id", "")
+        if saved_id:
+            return saved_id
+        new_id = str(uuid.uuid4())
+        self.config.set("student.student_id", new_id)
+        self.config.save()
+        return new_id
 
     def _setup_callbacks(self):
         self.tcp_client.on_connect = self._on_connected

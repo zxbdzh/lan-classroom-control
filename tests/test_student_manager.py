@@ -183,3 +183,64 @@ class TestStudentManager:
 
         mgr.remove_student("test-stu-001")
         assert len(removed) == 1
+
+    def test_reconnect_same_student_id_preserves_config(self, sample_student):
+        mgr = StudentManager()
+        mgr.add_student(sample_student)
+        mgr.set_display_name("test-stu-001", "张三")
+        mgr.set_group("test-stu-001", "第1组")
+
+        new_student = StudentInfo(
+            student_id="test-stu-001",
+            hostname="PC-001",
+            ip="192.168.1.101",
+            mac="00:11:22:33:44:55",
+            version="1.0.0"
+        )
+        mgr.add_student(new_student)
+
+        assert mgr.count() == 1
+        s = mgr.get_student("test-stu-001")
+        assert s.display_name == "张三"
+        assert s.group == "第1组"
+
+    def test_reconnect_different_id_same_mac_findable(self, sample_student):
+        mgr = StudentManager()
+        mgr.add_student(sample_student)
+
+        found = mgr.find_by_mac("00:11:22:33:44:55")
+        assert found is not None
+        assert found.student_id == "test-stu-001"
+        assert found.hostname == "PC-001"
+
+    def test_mac_case_insensitive(self, sample_student):
+        mgr = StudentManager()
+        mgr.add_student(sample_student)
+
+        found_upper = mgr.find_by_mac("00:11:22:33:44:55".upper())
+        assert found_upper is not None
+        assert found_upper.student_id == "test-stu-001"
+
+    def test_empty_mac_not_matched(self, sample_student):
+        mgr = StudentManager()
+        mgr.add_student(sample_student)
+
+        found = mgr.find_by_mac("")
+        assert found is None
+
+    def test_offline_student_reconnect_returns_online(self, sample_student):
+        mgr = StudentManager()
+        mgr.add_student(sample_student)
+        mgr.set_student_offline("test-stu-001")
+        assert not mgr.get_student("test-stu-001").online
+
+        new_student = StudentInfo(
+            student_id="test-stu-001",
+            hostname="PC-001",
+            ip="192.168.1.101",
+            mac="00:11:22:33:44:55",
+            version="1.0.0"
+        )
+        mgr.add_student(new_student)
+        assert mgr.count() == 1
+        assert mgr.get_student("test-stu-001").online
