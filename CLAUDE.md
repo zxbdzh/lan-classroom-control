@@ -25,7 +25,7 @@
 
 | 层级 | 技术 | 说明 |
 |------|------|------|
-| 语言 | Python 3.10+ | 主开发语言 |
+| 语言 | Python 3.8+ | 主开发语言（兼容 Win7） |
 | GUI | PyQt5 | 跨平台桌面 UI（兼容 Win7） |
 | 截屏 | mss + Pillow | 高性能跨平台截屏 |
 | 键鼠禁用 | ctypes BlockInput (Win) / pynput (其他) | 系统级键鼠拦截 |
