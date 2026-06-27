@@ -21,17 +21,18 @@ jobs:
         with:
           python-version: '3.8'
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
       - name: Install dependencies
         shell: pwsh
         run: |
-          pip install --upgrade pip
-          pip install pyinstaller
-          pip install -r requirements.txt
+          uv sync --locked --python 3.8 --group build
 
       - name: Build Teacher (教师端)
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onedir --windowed `
+          uv run --locked pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Teacher `
             --add-data "common;common" `
             --add-data "version.txt;." `
@@ -50,7 +51,7 @@ jobs:
       - name: Build Student (学生端)
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onedir --windowed `
+          uv run --locked pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Student `
             --add-data "common;common" `
             --add-data "version.txt;." `

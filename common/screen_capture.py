@@ -46,43 +46,44 @@ class ScreenCapturer:
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
-        if self._sct:
-            self._sct.close()
-            self._sct = None
+            self._thread = None
+        self._sct = None
         logger.info("Screen capturer stopped")
 
     def _capture_loop(self):
         if not MSS_AVAILABLE:
             logger.error("mss is not available, cannot capture screen")
             return
-        with mss.mss() as sct:
-            self._sct = sct
-            monitors = sct.monitors
-            if self.monitor >= len(monitors):
-                logger.warning(f"Monitor {self.monitor} not found, using monitor 0")
-                self.monitor = 0
-            monitor_info = monitors[self.monitor]
-            self._frame_size = (monitor_info["width"], monitor_info["height"])
-            last_time = 0
-            while self._running:
-                start_time = time.time()
-                try:
-                    raw = sct.grab(monitor_info)
-                    if not raw or not raw.rgb:
-                        continue
-                    img = Image.frombytes("RGB", raw.size, raw.rgb)
-                    jpeg_data = self._compress_frame(img)
-                    with self._frame_lock:
-                        self._current_frame = jpeg_data
-                        self._last_frame = img
-                    if self._on_frame:
-                        self._on_frame(jpeg_data, img.size)
-                except Exception as e:
-                    logger.debug(f"Capture error: {e}")
-                elapsed = time.time() - start_time
-                sleep_time = self._frame_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+        try:
+            with mss.mss() as sct:
+                self._sct = sct
+                monitors = sct.monitors
+                if self.monitor >= len(monitors):
+                    logger.warning(f"Monitor {self.monitor} not found, using monitor 0")
+                    self.monitor = 0
+                monitor_info = monitors[self.monitor]
+                self._frame_size = (monitor_info["width"], monitor_info["height"])
+                while self._running:
+                    start_time = time.time()
+                    try:
+                        raw = sct.grab(monitor_info)
+                        if not raw or not raw.rgb:
+                            continue
+                        img = Image.frombytes("RGB", raw.size, raw.rgb)
+                        jpeg_data = self._compress_frame(img)
+                        with self._frame_lock:
+                            self._current_frame = jpeg_data
+                            self._last_frame = img
+                        if self._on_frame:
+                            self._on_frame(jpeg_data, img.size)
+                    except Exception as e:
+                        logger.debug(f"Capture error: {e}")
+                    elapsed = time.time() - start_time
+                    sleep_time = self._frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+        finally:
+            self._sct = None
 
     def _compress_frame(self, img: Image.Image) -> bytes:
         buf = io.BytesIO()

@@ -62,14 +62,14 @@ lan-classroom-control/
 
 ### 安装依赖
 ```bash
-pip install -r requirements.txt
+uv sync --python 3.8
 ```
 
 ## 快速开始
 
 ### 启动教师端
 ```bash
-python teacher/main.py
+uv run teacher
 ```
 
 教师端启动后会自动：
@@ -79,7 +79,7 @@ python teacher/main.py
 
 ### 启动学生端
 ```bash
-python student/main.py
+uv run student
 ```
 
 学生端启动后会自动：
@@ -116,7 +116,7 @@ python student/main.py
 
 运行全部测试：
 ```bash
-python -m pytest tests/ -v
+uv run pytest tests -v
 ```
 
 测试覆盖：

@@ -36,6 +36,7 @@ ENV/
 
 # Project
 *.spec
+*.zip
 *.log
 .pytest_cache/
 .coverage
