@@ -1,7 +1,7 @@
 import sys
-from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPalette
+from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
+from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPalette
 from io import BytesIO
 from PIL import Image
 
@@ -17,15 +17,15 @@ class OverlayWindow(QWidget):
 
     def _setup_ui(self):
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setCursor(Qt.CursorShape.BlankCursor)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setCursor(Qt.BlankCursor)
 
         self._label = QLabel(self)
-        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setAlignment(Qt.AlignCenter)
         self._label.setStyleSheet("background-color: black;")
 
         layout = QVBoxLayout(self)
@@ -33,7 +33,7 @@ class OverlayWindow(QWidget):
         layout.addWidget(self._label)
 
         self._message_label = QLabel("正在接收屏幕广播...", self)
-        self._message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._message_label.setAlignment(Qt.AlignCenter)
         self._message_label.setStyleSheet("""
             color: #666;
             font-size: 24px;
@@ -73,7 +73,7 @@ class OverlayWindow(QWidget):
                 img.width,
                 img.height,
                 img.width * 3,
-                QImage.Format.Format_RGB888
+                QImage.Format_RGB888
             )
             pixmap = QPixmap.fromImage(qimg)
             self._current_pixmap = pixmap
@@ -87,8 +87,8 @@ class OverlayWindow(QWidget):
         if self._current_pixmap:
             scaled = self._current_pixmap.scaled(
                 self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
             )
             self._label.setPixmap(scaled)
 

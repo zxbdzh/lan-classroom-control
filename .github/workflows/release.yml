@@ -34,16 +34,16 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Teacher `
             --add-data "common;common" `
-            --hidden-import PyQt6 `
-            --hidden-import PyQt6.QtCore `
-            --hidden-import PyQt6.QtGui `
-            --hidden-import PyQt6.QtWidgets `
+            --hidden-import PyQt5 `
+            --hidden-import PyQt5.QtCore `
+            --hidden-import PyQt5.QtGui `
+            --hidden-import PyQt5.QtWidgets `
             --hidden-import pycryptodome `
             --hidden-import numpy `
             --hidden-import mss `
             --hidden-import PIL `
             --hidden-import psutil `
-            --collect-all PyQt6 `
+            --collect-all PyQt5 `
             teacher/main.py
 
       - name: Build Student (学生端)
@@ -52,17 +52,17 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed `
             --name LanClassroom-Student `
             --add-data "common;common" `
-            --hidden-import PyQt6 `
-            --hidden-import PyQt6.QtCore `
-            --hidden-import PyQt6.QtGui `
-            --hidden-import PyQt6.QtWidgets `
+            --hidden-import PyQt5 `
+            --hidden-import PyQt5.QtCore `
+            --hidden-import PyQt5.QtGui `
+            --hidden-import PyQt5.QtWidgets `
             --hidden-import pycryptodome `
             --hidden-import numpy `
             --hidden-import mss `
             --hidden-import PIL `
             --hidden-import psutil `
             --hidden-import pynput `
-            --collect-all PyQt6 `
+            --collect-all PyQt5 `
             student/main.py
 
       - name: Package Teacher

@@ -3,7 +3,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt6.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication
 from teacher.ui.main_window import TeacherMainWindow
 from common.logger import get_logger
 

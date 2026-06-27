@@ -1,11 +1,12 @@
-from PyQt6.QtWidgets import (
+from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QLabel, QStatusBar, QFileDialog, QMessageBox, QMenu, QInputDialog,
-    QGridLayout, QScrollArea, QFrame, QPushButton, QTabWidget, QAbstractItemView
+    QGridLayout, QScrollArea, QFrame, QPushButton, QTabWidget, QAbstractItemView,
+    QAction
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize
-from PyQt6.QtGui import QAction, QIcon, QPixmap, QFont, QColor, QBrush
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
+from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QBrush
 from typing import List, Optional, Dict
 from teacher.core.teacher_server import TeacherServer
 from teacher.core.student_manager import StudentInfo
@@ -21,7 +22,7 @@ class StudentThumbWidget(QFrame):
         self._setup_ui()
 
     def _setup_ui(self):
-        self.setFrameShape(QFrame.Shape.Box)
+        self.setFrameShape(QFrame.Box)
         self.setLineWidth(1)
         self.setStyleSheet("""
             QFrame {
@@ -39,18 +40,18 @@ class StudentThumbWidget(QFrame):
 
         self.screen_label = QLabel()
         self.screen_label.setMinimumSize(160, 120)
-        self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.screen_label.setAlignment(Qt.AlignCenter)
         self.screen_label.setStyleSheet("background: #1a1a1a; color: #666;")
         self.screen_label.setText("无画面")
         layout.addWidget(self.screen_label)
 
         self.name_label = QLabel(self.student.display_name)
-        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setAlignment(Qt.AlignCenter)
         self.name_label.setStyleSheet("color: #ddd; font-size: 12px;")
         layout.addWidget(self.name_label)
 
         self.status_label = QLabel()
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("font-size: 10px;")
         self._update_status()
         layout.addWidget(self.status_label)
@@ -219,7 +220,7 @@ class TeacherMainWindow(QMainWindow):
         toolbar.addAction(action_scan)
 
     def _create_central_widget(self):
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = QSplitter(Qt.Horizontal)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -238,9 +239,9 @@ class TeacherMainWindow(QMainWindow):
 
         self.student_tree = QTreeWidget()
         self.student_tree.setHeaderLabels(["学生", "状态"])
-        self.student_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.student_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.student_tree.itemSelectionChanged.connect(self._on_selection_changed)
-        self.student_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.student_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.student_tree.customContextMenuRequested.connect(self._on_student_context_menu)
         student_layout.addWidget(self.student_tree)
 
@@ -263,7 +264,7 @@ class TeacherMainWindow(QMainWindow):
         discover_layout.addLayout(discover_header)
 
         self.discover_list = QListWidget()
-        self.discover_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.discover_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.discover_list.itemSelectionChanged.connect(self._on_discover_selection_changed)
         self.discover_list.itemDoubleClicked.connect(self._on_discover_double_click)
         discover_layout.addWidget(self.discover_list)
@@ -351,7 +352,7 @@ class TeacherMainWindow(QMainWindow):
                 if student.status.get("net_blocked"):
                     status += " 禁网"
                 item = QTreeWidgetItem(group_item, [student.display_name, status])
-                item.setData(0, Qt.ItemDataRole.UserRole, student.student_id)
+                item.setData(0, Qt.UserRole, student.student_id)
                 if not student.online:
                     item.setForeground(0, QBrush(QColor("#888")))
         self.student_tree.expandAll()
@@ -379,7 +380,7 @@ class TeacherMainWindow(QMainWindow):
     def _get_selected_student_ids(self) -> List[str]:
         sids = []
         for item in self.student_tree.selectedItems():
-            sid = item.data(0, Qt.ItemDataRole.UserRole)
+            sid = item.data(0, Qt.UserRole)
             if sid:
                 sids.append(sid)
         return sids
@@ -391,7 +392,7 @@ class TeacherMainWindow(QMainWindow):
         item = self.student_tree.itemAt(pos)
         if not item:
             return
-        sid = item.data(0, Qt.ItemDataRole.UserRole)
+        sid = item.data(0, Qt.UserRole)
         if not sid:
             return
 
@@ -419,9 +420,9 @@ class TeacherMainWindow(QMainWindow):
             self.server.start_broadcast([sid])
         elif action == action_stop:
             self.server.stop_broadcast([sid])
-        elif action == action_net_block:
+        elif action == action_block:
             self.server.send_net_control([sid], True)
-        elif action == action_net_unblock:
+        elif action == action_unblock:
             self.server.send_net_control([sid], False)
 
     def _rename_student(self, student_id: str):
@@ -440,7 +441,7 @@ class TeacherMainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self, "屏幕广播", "未选择学生，是否对全体在线学生开始广播？"
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            if reply != QMessageBox.Yes:
                 return
             self.server.start_broadcast()
         else:
@@ -459,7 +460,7 @@ class TeacherMainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self, "黑屏肃静", "未选择学生，是否对全体在线学生启用黑屏？"
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            if reply != QMessageBox.Yes:
                 return
             self.server.send_black_screen_all(True)
         else:
@@ -478,7 +479,7 @@ class TeacherMainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self, "禁用上网", "未选择学生，是否对全体在线学生禁用上网？"
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            if reply != QMessageBox.Yes:
                 return
             self.server.send_net_control_all(True)
         else:
@@ -500,7 +501,7 @@ class TeacherMainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self, "发送文件", "未选择学生，是否发送给全体在线学生？"
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            if reply != QMessageBox.Yes:
                 return
             self.server.send_file_all(file_path)
         else:
@@ -547,7 +548,7 @@ class TeacherMainWindow(QMainWindow):
             ip = info.get("ip", "")
             mac = info.get("mac", "")
             item = QListWidgetItem(f"{hostname}  ({ip})")
-            item.setData(Qt.ItemDataRole.UserRole, info)
+            item.setData(Qt.UserRole, info)
             item.setToolTip(f"主机名: {hostname}\nIP: {ip}\nMAC: {mac}")
             self.discover_list.addItem(item)
         count = len(self._discovered_cache)
@@ -558,7 +559,7 @@ class TeacherMainWindow(QMainWindow):
         self.btn_add_selected.setEnabled(len(items) > 0)
 
     def _on_discover_double_click(self, item):
-        info = item.data(Qt.ItemDataRole.UserRole)
+        info = item.data(Qt.UserRole)
         if info:
             self._add_discovered_device(info)
 
@@ -568,7 +569,7 @@ class TeacherMainWindow(QMainWindow):
             return
         added = 0
         for item in items:
-            info = item.data(Qt.ItemDataRole.UserRole)
+            info = item.data(Qt.UserRole)
             if info:
                 self._add_discovered_device(info)
                 added += 1
@@ -587,7 +588,7 @@ class TeacherMainWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "确认退出", "确定要退出教师端吗？"
         )
-        if reply == QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.Yes:
             self.server.stop()
             event.accept()
         else:

@@ -26,7 +26,7 @@
 | 层级 | 技术 | 说明 |
 |------|------|------|
 | 语言 | Python 3.10+ | 主开发语言 |
-| GUI | PyQt6 | 跨平台桌面 UI |
+| GUI | PyQt5 | 跨平台桌面 UI（兼容 Win7） |
 | 截屏 | mss + Pillow | 高性能跨平台截屏 |
 | 键鼠禁用 | ctypes BlockInput (Win) / pynput (其他) | 系统级键鼠拦截 |
 | 网络管控 | netsh (Win) / iptables (Linux) | 系统防火墙规则 |
@@ -59,7 +59,7 @@ lan-classroom-control/
 │   │   ├── screen_broadcast.py  # 屏幕广播：截屏→JPEG→TCP 发送，支持指定/全体学生
 │   │   └── file_distributor.py  # 文件分发：一对多并发传输，进度回调
 │   └── ui/
-│       └── main_window.py       # PyQt6 主窗口：工具栏+学生树+屏幕墙+右键菜单，深色主题
+│       └── main_window.py       # PyQt5 主窗口：工具栏+学生树+屏幕墙+右键菜单，深色主题
 │
 ├── student/                 # 学生端
 │   ├── main.py              # 入口：StudentApp 类，系统托盘运行，关闭窗口不退出
@@ -135,7 +135,7 @@ lan-classroom-control/
 
 ### 线程模型
 
-- **主线程**：PyQt6 事件循环（UI）
+- **主线程**：PyQt5 事件循环（UI）
 - **TCP accept 线程**：接受新连接
 - **每连接 recv 线程**：独立接收消息
 - **心跳发送线程**：学生端定时发送心跳

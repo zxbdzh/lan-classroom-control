@@ -4,9 +4,9 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
-from PyQt6.QtCore import Qt, QObject, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
+from PyQt5.QtCore import Qt, QObject, pyqtSignal
 from student.core.student_client import StudentClient
 from student.ui.overlay import OverlayWindow
 from common.logger import get_logger
@@ -90,18 +90,18 @@ class StudentAppUI(QObject):
 
     def _create_tray_icon(self):
         pixmap = QPixmap(32, 32)
-        pixmap.fill(Qt.GlobalColor.transparent)
+        pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing)
         painter.setBrush(QColor("#0078d4"))
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(2, 2, 28, 28, 6, 6)
         painter.setPen(QColor("white"))
         font = painter.font()
         font.setBold(True)
         font.setPointSize(14)
         painter.setFont(font)
-        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "S")
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "S")
         painter.end()
         return QIcon(pixmap)
 
@@ -155,7 +155,7 @@ class StudentAppUI(QObject):
                 self.tray.showMessage(
                     "文件接收完成",
                     f"文件已保存到: {file_path}",
-                    QSystemTrayIcon.MessageIcon.Information,
+                    QSystemTrayIcon.Information,
                     5000
                 )
             except Exception as e:
