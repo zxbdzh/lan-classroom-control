@@ -24,9 +24,10 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
-            | Qt.Tool
+            | Qt.Window
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setCursor(Qt.BlankCursor)
 
         self._label = QLabel(self)
@@ -53,18 +54,14 @@ class OverlayWindow(QWidget):
         self._label.setStyleSheet("background-color: black;")
         self._message_label.setText("")
         self._message_label.hide()
-        self.showFullScreen()
-        self.raise_()
-        self.activateWindow()
+        self._show_fullscreen_topmost()
 
     def show_broadcast(self):
         self._active = True
         self._message_label.setText("正在连接教师屏幕...")
         self._message_label.show()
         self._label.setStyleSheet("background-color: #111;")
-        self.showFullScreen()
-        self.raise_()
-        self.activateWindow()
+        self._show_fullscreen_topmost()
 
     def hide_overlay(self):
         self._active = False
@@ -73,6 +70,39 @@ class OverlayWindow(QWidget):
         self._label.clear()
         # 延迟隐藏，让积压的帧先被丢弃
         QTimer.singleShot(200, self.hide)
+
+    def _show_fullscreen_topmost(self):
+        desktop = QApplication.desktop()
+        if desktop:
+            self.setGeometry(desktop.screenGeometry())
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        self._force_windows_topmost()
+        QTimer.singleShot(120, self._force_windows_topmost)
+        QTimer.singleShot(500, self._force_windows_topmost)
+
+    def _force_windows_topmost(self):
+        if sys.platform != "win32" or not self.isVisible():
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            HWND_TOPMOST = -1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+        except Exception as e:
+            logger.debug(f"Force overlay topmost failed: {e}")
 
     def update_frame(self, frame_data: bytes, size: tuple):
         self.frame_received.emit(frame_data, size)

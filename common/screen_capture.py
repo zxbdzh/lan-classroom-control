@@ -17,12 +17,15 @@ except ImportError:
 
 class ScreenCapturer:
     def __init__(self, monitor: int = 0, fps: int = 20, quality: int = 70,
-                 use_diff: bool = True, block_size: int = 16):
+                 use_diff: bool = True, block_size: int = 16,
+                 max_width: int = 0, max_height: int = 0):
         self.monitor = monitor
         self.fps = fps
         self.quality = quality
         self.use_diff = use_diff
         self.block_size = block_size
+        self.max_width = max_width
+        self.max_height = max_height
         self._running = False
         self._thread = None
         self._last_frame: Optional[Image.Image] = None
@@ -70,6 +73,7 @@ class ScreenCapturer:
                         if not raw or not raw.rgb:
                             continue
                         img = Image.frombytes("RGB", raw.size, raw.rgb)
+                        img = self._resize_frame(img)
                         jpeg_data = self._compress_frame(img)
                         with self._frame_lock:
                             self._current_frame = jpeg_data
@@ -89,6 +93,18 @@ class ScreenCapturer:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=self.quality, optimize=True)
         return buf.getvalue()
+
+    def _resize_frame(self, img: Image.Image) -> Image.Image:
+        if self.max_width <= 0 and self.max_height <= 0:
+            return img
+        width, height = img.size
+        target_width = self.max_width or width
+        target_height = self.max_height or height
+        scale = min(target_width / width, target_height / height, 1.0)
+        if scale >= 1.0:
+            return img
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return img.resize(new_size, Image.LANCZOS)
 
     def get_current_frame(self) -> Optional[bytes]:
         with self._frame_lock:

@@ -24,6 +24,11 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
 
+      - name: Set up Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -68,6 +73,11 @@ jobs:
             --collect-all PyQt5 `
             student/main.py
 
+      - name: Build Student Installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer/student.iss
+
       - name: Package Teacher
         shell: pwsh
         run: |
@@ -87,5 +97,6 @@ jobs:
           gh release create $tag `
             ./LanClassroom-Teacher.zip `
             ./LanClassroom-Student.zip `
+            ./dist/installer/LanClassroom-Student-Setup.exe `
             --title "Release $tag" `
             --notes-file RELEASE.md

@@ -85,7 +85,7 @@ class TestTeacherStudentIntegration:
         client.stop()
         time.sleep(0.2)
 
-    def test_net_control_command(self, teacher_server):
+    def test_net_control_disabled_noop(self, teacher_server):
         server, tcp_port = teacher_server
         client = StudentClient()
         client.discover_listener.stop()
@@ -97,20 +97,11 @@ class TestTeacherStudentIntegration:
         students = server.student_manager.get_all_students()
         sid = students[0].student_id
 
-        with patch.object(client.net_controller, 'block_internet') as mock_block, \
-             patch.object(client.net_controller, 'unblock_internet') as mock_unblock:
-            mock_block.return_value = True
-            mock_unblock.return_value = True
-
-            server.send_net_control([sid], True)
-            time.sleep(0.3)
-            assert client.is_net_blocked is True
-            mock_block.assert_called_once()
-
-            server.send_net_control([sid], False)
-            time.sleep(0.3)
-            assert client.is_net_blocked is False
-            mock_unblock.assert_called_once()
+        server.send_net_control([sid], True)
+        time.sleep(0.3)
+        assert client.is_net_blocked is False
+        assert students[0].status.get("net_control_pending") is None
+        assert students[0].status.get("net_blocked") is False
 
         client.stop()
         time.sleep(0.2)
@@ -160,3 +151,28 @@ class TestTeacherStudentIntegration:
         client.tcp_client.disconnect()
         time.sleep(0.3)
         assert server.student_manager.online_count() == 0
+
+    def test_student_screen_frame_report(self, teacher_server):
+        server, tcp_port = teacher_server
+        client = StudentClient()
+        client.discover_listener.stop()
+        client.tcp_client.auto_reconnect = False
+
+        received = []
+        event = threading.Event()
+        server.on_student_screen_frame = lambda sid, data, size: (
+            received.append((sid, data, size)),
+            event.set()
+        )
+
+        client.tcp_client.connect("127.0.0.1", tcp_port)
+        time.sleep(0.3)
+        client._send_screen_frame(b"fake-jpeg-frame", (320, 180))
+
+        assert event.wait(timeout=2)
+        assert received[0][0] == client.student_id
+        assert received[0][1] == b"fake-jpeg-frame"
+        assert received[0][2] == (320, 180)
+
+        client.stop()
+        time.sleep(0.2)

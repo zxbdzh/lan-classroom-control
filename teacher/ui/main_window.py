@@ -1,13 +1,16 @@
+import os
+import threading
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QLabel, QStatusBar, QFileDialog, QMessageBox, QMenu, QInputDialog,
     QGridLayout, QScrollArea, QFrame, QPushButton, QTabWidget, QAbstractItemView,
-    QAction
+    QAction, QSlider, QSizePolicy, QRubberBand
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QRect, QPoint, QEvent
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QBrush
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from teacher.core.teacher_server import TeacherServer
 from teacher.core.student_manager import StudentInfo
 from common.logger import get_logger
@@ -41,13 +44,13 @@ class StudentThumbWidget(QFrame):
         self.screen_label = QLabel()
         self.screen_label.setMinimumSize(160, 120)
         self.screen_label.setAlignment(Qt.AlignCenter)
-        self.screen_label.setStyleSheet("background: #1a1a1a; color: #666;")
+        self.screen_label.setStyleSheet("background: #101010; color: #bdbdbd;")
         self.screen_label.setText("无画面")
         layout.addWidget(self.screen_label)
 
         self.name_label = QLabel(self.student.display_name)
         self.name_label.setAlignment(Qt.AlignCenter)
-        self.name_label.setStyleSheet("color: #ddd; font-size: 12px;")
+        self.name_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
         layout.addWidget(self.name_label)
 
         self.status_label = QLabel()
@@ -59,17 +62,15 @@ class StudentThumbWidget(QFrame):
     def _update_status(self):
         statuses = []
         if not self.student.online:
-            self.status_label.setStyleSheet("color: #888; font-size: 10px;")
+            self.status_label.setStyleSheet("color: #b8b8b8; font-size: 10px;")
             statuses.append("离线")
         else:
-            self.status_label.setStyleSheet("color: #4caf50; font-size: 10px;")
+            self.status_label.setStyleSheet("color: #35d06f; font-size: 10px;")
             statuses.append("在线")
         if self.student.status.get("black_screen"):
             statuses.append("黑屏")
         if self.student.status.get("broadcasting"):
             statuses.append("广播中")
-        if self.student.status.get("net_blocked"):
-            statuses.append("禁网")
         self.status_label.setText(" | ".join(statuses))
 
     def update_student(self, student: StudentInfo):
@@ -77,14 +78,169 @@ class StudentThumbWidget(QFrame):
         self.name_label.setText(student.display_name)
         self._update_status()
 
+    def update_frame(self, frame_data: bytes):
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(frame_data):
+            return
+        scaled = pixmap.scaled(
+            self.screen_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.screen_label.setPixmap(scaled)
+        self.screen_label.setText("")
+
+
+class ScreenWallThumbWidget(QFrame):
+    clicked = pyqtSignal(object, object)
+
+    def __init__(self, student: StudentInfo, zoom: int = 100, parent=None):
+        super().__init__(parent)
+        self.student = student
+        self._zoom = zoom
+        self._last_pixmap = QPixmap()
+        self._selected = False
+        self._setup_ui()
+        self.set_zoom(zoom)
+
+    def _setup_ui(self):
+        self.setObjectName("screenWallThumb")
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._apply_card_style()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.screen_label = QLabel()
+        self.screen_label.setAlignment(Qt.AlignCenter)
+        self.screen_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.screen_label.setStyleSheet("""
+            background: #101010;
+            color: #bdbdbd;
+            border: 1px solid #343434;
+            border-radius: 4px;
+        """)
+        self.screen_label.setText("无画面")
+        layout.addWidget(self.screen_label)
+
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(0, 0, 0, 0)
+        info_row.setSpacing(6)
+
+        self.name_label = QLabel(self.student.display_name)
+        self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.name_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
+        info_row.addWidget(self.name_label, 1)
+
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        info_row.addWidget(self.status_label)
+        layout.addLayout(info_row)
+
+        self._update_status()
+
+    def _update_status(self):
+        statuses = []
+        if not self.student.online:
+            self.status_label.setStyleSheet("color: #b8b8b8; font-size: 11px;")
+            statuses.append("离线")
+        else:
+            self.status_label.setStyleSheet("color: #35d06f; font-size: 11px;")
+            statuses.append("在线")
+        if self.student.status.get("black_screen"):
+            statuses.append("黑屏")
+        if self.student.status.get("broadcasting"):
+            statuses.append("广播")
+        self.status_label.setText(" | ".join(statuses))
+
+    def update_student(self, student: StudentInfo):
+        self.student = student
+        self.name_label.setText(student.display_name)
+        self._update_status()
+
+    def set_selected(self, selected: bool):
+        if self._selected == selected:
+            return
+        self._selected = selected
+        self._apply_card_style()
+
+    def _apply_card_style(self):
+        border = "#2d8cff" if self._selected else "#3f3f3f"
+        background = "#263247" if self._selected else "#242424"
+        self.setStyleSheet(f"""
+            QFrame#screenWallThumb {{
+                background: {background};
+                border: 2px solid {border};
+                border-radius: 6px;
+            }}
+            QFrame#screenWallThumb:hover {{
+                border: 2px solid #2d8cff;
+            }}
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.student.student_id, event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def update_frame(self, frame_data: bytes):
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(frame_data):
+            return
+        self._last_pixmap = pixmap
+        self._render_frame()
+
+    def set_zoom(self, zoom: int):
+        self._zoom = zoom
+        card_width = max(190, int(260 * zoom / 100))
+        preview_width = card_width - 16
+        preview_height = max(100, int(preview_width * 9 / 16))
+        card_height = preview_height + 52
+        self.setFixedSize(card_width, card_height)
+        self.screen_label.setFixedSize(preview_width, preview_height)
+        self._render_frame()
+
+    def card_width(self) -> int:
+        return self.width() or max(190, int(260 * self._zoom / 100))
+
+    def _render_frame(self):
+        if self._last_pixmap.isNull():
+            return
+        scaled = self._last_pixmap.scaled(
+            self.screen_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.FastTransformation
+        )
+        self.screen_label.setPixmap(scaled)
+        self.screen_label.setText("")
+
 
 class TeacherMainWindow(QMainWindow):
+    student_added = pyqtSignal(object)
+    student_removed = pyqtSignal(object)
+    student_changed = pyqtSignal()
+    discovered_student = pyqtSignal(object)
+    discovered_lost = pyqtSignal(object)
+    student_screen_frame = pyqtSignal(object, object, object)
+    file_transfer_progress = pyqtSignal(object, object, object)
+    file_transfer_complete = pyqtSignal(object, object, object)
+    connection_refresh_complete = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.server = TeacherServer()
         self._selected_students = set()
         self._thumb_widgets = {}
         self._discovered_cache: Dict[str, dict] = {}
+        self._wall_zoom = 100
+        self._wall_cols = 0
+        self._wall_rubber_band = None
+        self._wall_drag_origin = QPoint()
+        self._syncing_selection = False
+        self._file_transfers: Dict[str, dict] = {}
         self._setup_ui()
         self._setup_callbacks()
         self.server.start()
@@ -111,7 +267,7 @@ class TeacherMainWindow(QMainWindow):
             }
             QToolButton {
                 background: #3a3a3a;
-                color: #ddd;
+                color: #f5f5f5;
                 border: none;
                 padding: 8px 16px;
                 border-radius: 4px;
@@ -125,11 +281,18 @@ class TeacherMainWindow(QMainWindow):
             }
             QListWidget, QTreeWidget {
                 background: #252525;
-                color: #ddd;
+                color: #f5f5f5;
                 border: 1px solid #333;
+            }
+            QHeaderView::section {
+                background: #f2f2f2;
+                color: #111;
+                border: 1px solid #cfcfcf;
+                padding: 4px;
             }
             QListWidget::item:selected, QTreeWidget::item:selected {
                 background: #0078d4;
+                color: #fff;
             }
             QTabWidget::pane {
                 border: 1px solid #333;
@@ -137,7 +300,7 @@ class TeacherMainWindow(QMainWindow):
             }
             QTabBar::tab {
                 background: #2d2d2d;
-                color: #aaa;
+                color: #d6d6d6;
                 padding: 8px 16px;
                 border: 1px solid #333;
                 border-bottom: none;
@@ -162,14 +325,28 @@ class TeacherMainWindow(QMainWindow):
             }
             QStatusBar {
                 background: #2d2d2d;
-                color: #aaa;
+                color: #f0f0f0;
             }
             QLabel {
-                color: #ddd;
+                color: #f2f2f2;
             }
             QScrollArea {
                 background: #1e1e1e;
                 border: none;
+            }
+            QMessageBox {
+                background: #f6f6f6;
+            }
+            QMessageBox QLabel {
+                color: #202020;
+                background: transparent;
+                font-size: 13px;
+            }
+            QMessageBox QPushButton {
+                background: #0078d4;
+                color: white;
+                min-width: 72px;
+                padding: 6px 14px;
             }
         """)
 
@@ -197,18 +374,6 @@ class TeacherMainWindow(QMainWindow):
         action_unblack.triggered.connect(self._on_unblack_screen)
         toolbar.addAction(action_unblack)
 
-        toolbar.addSeparator()
-
-        action_block_net = QAction("禁用上网", self)
-        action_block_net.triggered.connect(self._on_block_net)
-        toolbar.addAction(action_block_net)
-
-        action_unblock_net = QAction("解除禁网", self)
-        action_unblock_net.triggered.connect(self._on_unblock_net)
-        toolbar.addAction(action_unblock_net)
-
-        toolbar.addSeparator()
-
         action_send_file = QAction("发送文件", self)
         action_send_file.triggered.connect(self._on_send_file)
         toolbar.addAction(action_send_file)
@@ -222,6 +387,10 @@ class TeacherMainWindow(QMainWindow):
         action_scan = QAction("扫描设备", self)
         action_scan.triggered.connect(self._on_scan_devices)
         toolbar.addAction(action_scan)
+
+        action_refresh = QAction("刷新连接", self)
+        action_refresh.triggered.connect(self._on_refresh_connections)
+        toolbar.addAction(action_refresh)
 
     def _create_central_widget(self):
         splitter = QSplitter(Qt.Horizontal)
@@ -287,19 +456,52 @@ class TeacherMainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(8)
 
         right_title = QLabel("屏幕墙")
         right_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
         right_layout.addWidget(right_title)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        wall_controls = QHBoxLayout()
+        wall_controls.setContentsMargins(0, 0, 0, 0)
+        wall_controls.setSpacing(8)
+
+        self.wall_summary_label = QLabel("0 台在线")
+        self.wall_summary_label.setStyleSheet("color: #888; font-size: 12px;")
+        wall_controls.addWidget(self.wall_summary_label)
+        wall_controls.addStretch()
+
+        zoom_title = QLabel("缩放")
+        zoom_title.setStyleSheet("color: #aaa; font-size: 12px;")
+        wall_controls.addWidget(zoom_title)
+
+        self.wall_zoom_slider = QSlider(Qt.Horizontal)
+        self.wall_zoom_slider.setRange(70, 180)
+        self.wall_zoom_slider.setSingleStep(10)
+        self.wall_zoom_slider.setPageStep(10)
+        self.wall_zoom_slider.setValue(self._wall_zoom)
+        self.wall_zoom_slider.setFixedWidth(150)
+        self.wall_zoom_slider.valueChanged.connect(self._on_wall_zoom_changed)
+        wall_controls.addWidget(self.wall_zoom_slider)
+
+        self.wall_zoom_label = QLabel(f"{self._wall_zoom}%")
+        self.wall_zoom_label.setMinimumWidth(42)
+        self.wall_zoom_label.setStyleSheet("color: #ddd; font-size: 12px;")
+        wall_controls.addWidget(self.wall_zoom_label)
+
+        right_layout.addLayout(wall_controls)
+
+        self.wall_scroll = QScrollArea()
+        self.wall_scroll.setWidgetResizable(True)
         self.wall_widget = QWidget()
+        self.wall_widget.setStyleSheet("background: #1e1e1e;")
         self.wall_layout = QGridLayout(self.wall_widget)
-        self.wall_layout.setSpacing(8)
-        self.wall_layout.setContentsMargins(4, 4, 4, 4)
-        scroll.setWidget(self.wall_widget)
-        right_layout.addWidget(scroll)
+        self.wall_layout.setSpacing(10)
+        self.wall_layout.setContentsMargins(8, 8, 8, 8)
+        self.wall_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.wall_widget.installEventFilter(self)
+        self.wall_scroll.setWidget(self.wall_widget)
+        right_layout.addWidget(self.wall_scroll)
 
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(1, 3)
@@ -314,12 +516,30 @@ class TeacherMainWindow(QMainWindow):
         self.status_label = QLabel("初始化中...")
         self.status_bar.addWidget(self.status_label)
 
+        self.transfer_label = QLabel("")
+        self.transfer_label.setMinimumWidth(260)
+        self.transfer_label.setStyleSheet("color: #ddd;")
+        self.status_bar.addPermanentWidget(self.transfer_label)
+
     def _setup_callbacks(self):
-        self.server.on_student_added = self._on_student_added
-        self.server.on_student_removed = self._on_student_removed
-        self.server.on_student_changed = self._on_student_changed
-        self.server.on_discovered_student = self._on_discovered_student
-        self.server.on_discovered_lost = self._on_discovered_lost
+        self.server.on_student_added = self.student_added.emit
+        self.server.on_student_removed = self.student_removed.emit
+        self.server.on_student_changed = self.student_changed.emit
+        self.server.on_discovered_student = self.discovered_student.emit
+        self.server.on_discovered_lost = self.discovered_lost.emit
+        self.server.on_student_screen_frame = self.student_screen_frame.emit
+        self.server.file_distributor.on_progress = self.file_transfer_progress.emit
+        self.server.file_distributor.on_complete = self.file_transfer_complete.emit
+
+        self.student_added.connect(self._on_student_added)
+        self.student_removed.connect(self._on_student_removed)
+        self.student_changed.connect(self._on_student_changed)
+        self.discovered_student.connect(self._on_discovered_student)
+        self.discovered_lost.connect(self._on_discovered_lost)
+        self.student_screen_frame.connect(self._on_student_screen_frame)
+        self.file_transfer_progress.connect(self._on_file_transfer_progress)
+        self.file_transfer_complete.connect(self._on_file_transfer_complete)
+        self.connection_refresh_complete.connect(self._on_connection_refresh_complete)
 
     def _on_student_added(self, student: StudentInfo):
         sid = student.student_id
@@ -353,44 +573,249 @@ class TeacherMainWindow(QMainWindow):
                     status += " 黑屏"
                 if student.status.get("broadcasting"):
                     status += " 广播"
-                if student.status.get("net_blocked"):
-                    status += " 禁网"
                 item = QTreeWidgetItem(group_item, [student.display_name, status])
                 item.setData(0, Qt.UserRole, student.student_id)
                 if not student.online:
                     item.setForeground(0, QBrush(QColor("#888")))
         self.student_tree.expandAll()
+        self._sync_tree_selection_from_selected()
 
     def _refresh_screen_wall(self):
-        for i in reversed(range(self.wall_layout.count())):
-            self.wall_layout.itemAt(i).widget().setParent(None)
+        self._clear_wall_layout()
         self._thumb_widgets.clear()
 
         students = self.server.student_manager.get_all_students()
-        cols = 4
+        cols = self._calculate_wall_columns()
         for idx, student in enumerate(students):
-            thumb = StudentThumbWidget(student)
+            thumb = ScreenWallThumbWidget(student, zoom=self._wall_zoom)
+            thumb.clicked.connect(self._on_wall_thumb_clicked)
+            thumb.setContextMenuPolicy(Qt.CustomContextMenu)
+            thumb.customContextMenuRequested.connect(
+                lambda pos, sid=student.student_id, widget=thumb:
+                    self._on_wall_context_menu(widget.mapToGlobal(pos), sid)
+            )
+            thumb.set_selected(student.student_id in self._selected_students)
             row = idx // cols
             col = idx % cols
             self.wall_layout.addWidget(thumb, row, col)
             self._thumb_widgets[student.student_id] = thumb
+        self._wall_cols = cols
+        self._update_wall_summary()
 
     def _refresh_screen_wall_status(self):
         students = self.server.student_manager.get_all_students()
         for student in students:
             if student.student_id in self._thumb_widgets:
-                self._thumb_widgets[student.student_id].update_student(student)
+                thumb = self._thumb_widgets[student.student_id]
+                thumb.update_student(student)
+                thumb.set_selected(student.student_id in self._selected_students)
+        self._update_wall_summary()
+
+    def _on_student_screen_frame(self, student_id: str, frame_data: bytes, frame_size: tuple):
+        thumb = self._thumb_widgets.get(student_id)
+        if thumb:
+            thumb.update_frame(frame_data)
+
+    def _on_file_transfer_progress(self, transfer_id: str, sent_bytes: int, total_bytes: int):
+        info = self._file_transfers.setdefault(transfer_id, {
+            "file_name": "文件",
+            "target_count": 0,
+        })
+        info["sent_bytes"] = int(sent_bytes)
+        info["total_bytes"] = int(total_bytes)
+        info["status"] = "sending"
+        self._update_transfer_status_label(transfer_id)
+
+    def _on_file_transfer_complete(self, transfer_id: str, success: bool, error: str):
+        info = self._file_transfers.setdefault(transfer_id, {
+            "file_name": "文件",
+            "target_count": 0,
+        })
+        info["status"] = "done" if success else "failed"
+        info["error"] = error
+        self._update_transfer_status_label(transfer_id)
+        QTimer.singleShot(6000, self._clear_completed_transfer_status)
+
+    def _register_file_transfer(self, transfer_id: str, file_path: str, target_count: int):
+        old_info = self._file_transfers.get(transfer_id, {})
+        if old_info.get("status") in {"done", "failed"}:
+            return
+        self._file_transfers[transfer_id] = {
+            "file_name": os.path.basename(file_path),
+            "target_count": target_count,
+            "sent_bytes": old_info.get("sent_bytes", 0),
+            "total_bytes": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
+            "status": old_info.get("status", "sending"),
+            "error": old_info.get("error", ""),
+        }
+        self._update_transfer_status_label(transfer_id)
+
+    def _update_transfer_status_label(self, transfer_id: str):
+        info = self._file_transfers.get(transfer_id)
+        if not info or not hasattr(self, "transfer_label"):
+            return
+        total = max(0, int(info.get("total_bytes", 0)))
+        sent = max(0, int(info.get("sent_bytes", 0)))
+        percent = int(sent * 100 / total) if total > 0 else 0
+        target_count = int(info.get("target_count", 0))
+        file_name = info.get("file_name", "文件")
+        status = info.get("status", "sending")
+        if status == "done":
+            self.transfer_label.setText(f"文件传输完成: {file_name} -> {target_count} 台")
+        elif status == "failed":
+            self.transfer_label.setText(f"文件传输失败: {file_name} {info.get('error', '')}")
+        else:
+            self.transfer_label.setText(f"正在传输: {file_name} {percent}% -> {target_count} 台")
+
+    def _clear_completed_transfer_status(self):
+        if not hasattr(self, "transfer_label"):
+            return
+        active = [
+            (tid, info) for tid, info in self._file_transfers.items()
+            if info.get("status") == "sending"
+        ]
+        if active:
+            self._update_transfer_status_label(active[-1][0])
+        else:
+            self.transfer_label.setText("")
+
+    def _on_wall_zoom_changed(self, value: int):
+        self._wall_zoom = value
+        self.wall_zoom_label.setText(f"{value}%")
+        for thumb in self._thumb_widgets.values():
+            thumb.set_zoom(value)
+        self._relayout_screen_wall()
+
+    def _calculate_wall_columns(self) -> int:
+        viewport_width = max(1, self.wall_scroll.viewport().width() - 20)
+        card_width = max(190, int(260 * self._wall_zoom / 100))
+        spacing = self.wall_layout.spacing()
+        return max(1, viewport_width // (card_width + spacing))
+
+    def _relayout_screen_wall(self):
+        students = self.server.student_manager.get_all_students()
+        if not students:
+            self._update_wall_summary()
+            return
+        cols = self._calculate_wall_columns()
+        if cols == self._wall_cols and self.wall_layout.count() == len(students):
+            self._update_wall_summary()
+            return
+
+        for idx, student in enumerate(students):
+            thumb = self._thumb_widgets.get(student.student_id)
+            if not thumb:
+                continue
+            self.wall_layout.removeWidget(thumb)
+            self.wall_layout.addWidget(thumb, idx // cols, idx % cols)
+        self._wall_cols = cols
+        self._update_wall_summary()
+
+    def _clear_wall_layout(self):
+        for i in reversed(range(self.wall_layout.count())):
+            widget = self.wall_layout.itemAt(i).widget()
+            if widget:
+                self.wall_layout.removeWidget(widget)
+                widget.setParent(None)
+
+    def _update_wall_summary(self):
+        students = self.server.student_manager.get_all_students()
+        online = sum(1 for s in students if s.online)
+        self.wall_summary_label.setText(f"{online} 台在线 / {len(students)} 台总数")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "wall_scroll"):
+            QTimer.singleShot(0, self._relayout_screen_wall)
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "wall_widget", None):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                child = self.wall_widget.childAt(event.pos())
+                if child and child is not self.wall_widget:
+                    return False
+                self._wall_drag_origin = event.pos()
+                if self._wall_rubber_band is None:
+                    self._wall_rubber_band = QRubberBand(QRubberBand.Rectangle, self.wall_widget)
+                self._wall_rubber_band.setGeometry(QRect(self._wall_drag_origin, QSize()))
+                self._wall_rubber_band.show()
+                return True
+
+            if event.type() == QEvent.MouseMove and self._wall_rubber_band and self._wall_rubber_band.isVisible():
+                rect = QRect(self._wall_drag_origin, event.pos()).normalized()
+                self._wall_rubber_band.setGeometry(rect)
+                return True
+
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self._wall_rubber_band and self._wall_rubber_band.isVisible():
+                    rect = self._wall_rubber_band.geometry()
+                    self._wall_rubber_band.hide()
+                    selected = set(self._selected_students) if event.modifiers() & Qt.ControlModifier else set()
+                    for sid, thumb in self._thumb_widgets.items():
+                        if rect.intersects(thumb.geometry()):
+                            selected.add(sid)
+                    self._set_selected_students(selected)
+                    return True
+
+        return super().eventFilter(watched, event)
 
     def _get_selected_student_ids(self) -> List[str]:
-        sids = []
+        return list(self._selected_students)
+
+    def _on_selection_changed(self):
+        if self._syncing_selection:
+            return
+        if self.student_tree.topLevelItemCount() == 0:
+            return
+        self._selected_students = set(self._get_selected_student_ids())
+        selected = set()
         for item in self.student_tree.selectedItems():
             sid = item.data(0, Qt.UserRole)
             if sid:
-                sids.append(sid)
-        return sids
+                selected.add(sid)
+        self._selected_students = selected
+        self._sync_wall_selection_from_selected()
 
-    def _on_selection_changed(self):
-        self._selected_students = set(self._get_selected_student_ids())
+    def _sync_wall_selection_from_selected(self):
+        for sid, thumb in self._thumb_widgets.items():
+            thumb.set_selected(sid in self._selected_students)
+
+    def _sync_tree_selection_from_selected(self):
+        if not hasattr(self, "student_tree"):
+            return
+        self._syncing_selection = True
+        try:
+            self.student_tree.clearSelection()
+            root_count = self.student_tree.topLevelItemCount()
+            for i in range(root_count):
+                group_item = self.student_tree.topLevelItem(i)
+                for j in range(group_item.childCount()):
+                    item = group_item.child(j)
+                    sid = item.data(0, Qt.UserRole)
+                    if sid in self._selected_students:
+                        item.setSelected(True)
+        finally:
+            self._syncing_selection = False
+
+    def _set_selected_students(self, student_ids, sync_tree: bool = True):
+        self._selected_students = set(student_ids)
+        self._sync_wall_selection_from_selected()
+        if sync_tree:
+            self._sync_tree_selection_from_selected()
+
+    def _on_wall_thumb_clicked(self, student_id: str, event):
+        modifiers = event.modifiers()
+        selected = set(self._selected_students)
+        if modifiers & Qt.ControlModifier:
+            if student_id in selected:
+                selected.remove(student_id)
+            else:
+                selected.add(student_id)
+        elif modifiers & Qt.ShiftModifier:
+            selected.add(student_id)
+        else:
+            selected = {student_id}
+        self._set_selected_students(selected)
 
     def _on_student_context_menu(self, pos):
         item = self.student_tree.itemAt(pos)
@@ -399,35 +824,43 @@ class TeacherMainWindow(QMainWindow):
         sid = item.data(0, Qt.UserRole)
         if not sid:
             return
+        if sid not in self._selected_students:
+            self._set_selected_students({sid})
+        self._show_student_control_menu(
+            self.student_tree.viewport().mapToGlobal(pos),
+            list(self._selected_students)
+        )
+        return
 
+    def _on_wall_context_menu(self, global_pos, student_id: str):
+        if student_id not in self._selected_students:
+            self._set_selected_students({student_id})
+        self._show_student_control_menu(global_pos, list(self._selected_students))
+
+    def _show_student_control_menu(self, global_pos, student_ids: List[str]):
+        if not student_ids:
+            return
         menu = QMenu(self)
         action_rename = menu.addAction("重命名")
-        action_group = menu.addAction("移动到分组")
+        action_rename.setEnabled(len(student_ids) == 1)
         menu.addSeparator()
-        action_black = menu.addAction("黑屏")
+        action_black = menu.addAction("黑屏肃静")
         action_unblack = menu.addAction("解除黑屏")
         menu.addSeparator()
         action_broadcast = menu.addAction("开始广播")
         action_stop = menu.addAction("停止广播")
-        menu.addSeparator()
-        action_net_block = menu.addAction("禁用上网")
-        action_net_unblock = menu.addAction("解除禁网")
 
-        action = menu.exec(self.student_tree.viewport().mapToGlobal(pos))
+        action = menu.exec(global_pos)
         if action == action_rename:
-            self._rename_student(sid)
+            self._rename_student(student_ids[0])
         elif action == action_black:
-            self.server.send_black_screen([sid], True)
+            self.server.send_black_screen(student_ids, True)
         elif action == action_unblack:
-            self.server.send_black_screen([sid], False)
+            self.server.send_black_screen(student_ids, False)
         elif action == action_broadcast:
-            self.server.start_broadcast([sid])
+            self.server.start_broadcast(student_ids)
         elif action == action_stop:
-            self.server.stop_broadcast([sid])
-        elif action == action_block:
-            self.server.send_net_control([sid], True)
-        elif action == action_unblock:
-            self.server.send_net_control([sid], False)
+            self.server.stop_broadcast(student_ids)
 
     def _rename_student(self, student_id: str):
         student = self.server.student_manager.get_student(student_id)
@@ -478,28 +911,55 @@ class TeacherMainWindow(QMainWindow):
             self.server.send_black_screen(sids, False)
 
     def _on_block_net(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            reply = QMessageBox.question(
-                self, "禁用上网", "未选择学生，是否对全体在线学生禁用上网？"
-            )
-            if reply != QMessageBox.Yes:
-                return
-            self.server.send_net_control_all(True)
-        else:
-            self.server.send_net_control(sids, True)
+        logger.info("Network control is disabled in this build")
 
     def _on_unblock_net(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            self.server.send_net_control_all(False)
-        else:
-            self.server.send_net_control(sids, False)
+        logger.info("Network control is disabled in this build")
+
+    def _choose_file_target_dir(self) -> Optional[Tuple[str, str]]:
+        options = [
+            ("学生端默认目录", "default", ""),
+            ("学生端桌面", "desktop", ""),
+            ("学生端下载目录", "downloads", ""),
+            ("学生端文档目录", "documents", ""),
+            ("C:\\LanClassroom\\Downloads", "c_downloads", ""),
+            ("自定义路径...", "custom", ""),
+        ]
+        labels = [item[0] for item in options]
+        label, ok = QInputDialog.getItem(
+            self,
+            "选择保存位置",
+            "保存到学生端:",
+            labels,
+            1,
+            False
+        )
+        if not ok:
+            return None
+
+        for option_label, target_type, target_path in options:
+            if option_label == label:
+                if target_type == "custom":
+                    target_path, ok = QInputDialog.getText(
+                        self,
+                        "自定义保存路径",
+                        "请输入学生端绝对路径:",
+                        text="C:\\LanClassroom\\Downloads"
+                    )
+                    if not ok or not target_path.strip():
+                        return None
+                    return target_type, target_path.strip()
+                return target_type, target_path
+        return "default", ""
 
     def _on_send_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "所有文件 (*)")
         if not file_path:
             return
+        target_dir = self._choose_file_target_dir()
+        if target_dir is None:
+            return
+        target_dir_type, target_dir_path = target_dir
         sids = self._get_selected_student_ids()
         if not sids:
             reply = QMessageBox.question(
@@ -507,9 +967,22 @@ class TeacherMainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
-            self.server.send_file_all(file_path)
+            target_count = len(self.server.student_manager.get_online_students())
+            transfer_id = self.server.send_file_all(
+                file_path,
+                target_dir_type=target_dir_type,
+                target_dir_path=target_dir_path
+            )
+            self._register_file_transfer(transfer_id, file_path, target_count)
         else:
-            self.server.send_file(file_path, sids)
+            target_count = len(sids)
+            transfer_id = self.server.send_file(
+                file_path,
+                sids,
+                target_dir_type=target_dir_type,
+                target_dir_path=target_dir_path
+            )
+            self._register_file_transfer(transfer_id, file_path, target_count)
         QMessageBox.information(self, "发送文件", "文件已开始发送")
 
     def _on_push_update(self):
@@ -561,6 +1034,32 @@ class TeacherMainWindow(QMainWindow):
         self.discover_status.setText("正在扫描局域网...")
         self.server.scan_devices()
         QTimer.singleShot(3000, self._update_discover_status_text)
+
+    def _on_refresh_connections(self):
+        self.status_label.setText("正在检测学生端连接...")
+
+        def worker():
+            try:
+                result = self.server.refresh_connections()
+            except Exception as e:
+                logger.warning(f"Refresh connections failed: {e}")
+                result = {"error": str(e), "checked": 0, "alive": 0, "offline": 0}
+            self.connection_refresh_complete.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_connection_refresh_complete(self, result: dict):
+        self._refresh_student_list()
+        self._refresh_screen_wall_status()
+        self._update_status_bar()
+        if result.get("error"):
+            self.status_label.setText(f"连接检测失败: {result['error']}")
+            return
+        self.status_label.setText(
+            f"连接检测完成: 已检查 {result.get('checked', 0)} 台，"
+            f"在线响应 {result.get('alive', 0)} 台，标记离线 {result.get('offline', 0)} 台"
+        )
+        QTimer.singleShot(3500, self._update_status_bar)
 
     def _update_discover_status_text(self):
         count = len(self._discovered_cache)

@@ -33,6 +33,11 @@ class Config:
                 "server_ip": "",
                 "auto_connect": True,
                 "encryption_key": "",
+                "screen_monitor_enabled": True,
+                "screen_monitor_fps": 1,
+                "screen_monitor_quality": 45,
+                "screen_monitor_max_width": 640,
+                "screen_monitor_max_height": 360,
             },
             "ui": {
                 "theme": "default",

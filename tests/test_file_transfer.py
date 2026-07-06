@@ -2,7 +2,13 @@ import pytest
 import os
 import tempfile
 import hashlib
-from common.file_transfer import FileTransferSender, FileTransferReceiver, CHUNK_SIZE
+import time
+from common.file_transfer import (
+    FileTransferSender,
+    FileTransferReceiver,
+    CHUNK_SIZE,
+    TARGET_DIR_CUSTOM,
+)
 
 
 @pytest.fixture
@@ -179,6 +185,44 @@ class TestFileTransferReceiver:
         })
         assert success is True
 
+    def test_target_custom_dir(self, temp_dir, test_file):
+        file_path, content = test_file
+        sender = FileTransferSender()
+        save_dir = os.path.join(temp_dir, "received")
+        target_dir = os.path.join(temp_dir, "student-target")
+        receiver = FileTransferReceiver(save_dir)
+
+        transfer_id = "custom-dir-test"
+        md5 = sender.compute_md5(file_path)
+        receiver.handle_start({
+            "transfer_id": transfer_id,
+            "file_name": "custom.txt",
+            "file_size": len(content),
+            "total_chunks": 1,
+            "md5": md5,
+            "target_dir_type": TARGET_DIR_CUSTOM,
+            "target_dir_path": target_dir,
+        })
+
+        import struct
+        from common.file_transfer import FILE_HEADER_FORMAT
+        header = struct.pack(FILE_HEADER_FORMAT, 1, 0, len(content))
+        receiver.handle_data({
+            "transfer_id": transfer_id,
+            "chunk_index": 0,
+            "data": header + content,
+        })
+
+        success, result = receiver.handle_end({
+            "transfer_id": transfer_id,
+            "total_chunks": 1,
+            "md5": md5,
+        })
+        assert success is True
+        assert os.path.dirname(result) == target_dir
+        with open(result, "rb") as f:
+            assert f.read() == content
+
     def test_chinese_filename(self, temp_dir, test_file):
         file_path, content = test_file
         sender = FileTransferSender()
@@ -216,3 +260,41 @@ class TestFileTransferReceiver:
         })
         assert success is True
         assert os.path.basename(result) == file_name
+
+
+class TestFileDistributor:
+    def test_start_message_contains_target_dir(self, temp_dir, test_file):
+        from teacher.core.file_distributor import FileDistributor
+
+        file_path, _ = test_file
+        sent_messages = []
+
+        class FakeConn:
+            def is_alive(self):
+                return True
+
+            def send_message(self, msg):
+                sent_messages.append(msg)
+                return True
+
+        class FakeStudent:
+            conn = FakeConn()
+
+        distributor = FileDistributor()
+        target_dir = os.path.join(temp_dir, "target")
+        transfer_id = distributor.send_file_to_students(
+            file_path=file_path,
+            students=[FakeStudent()],
+            target_dir_type=TARGET_DIR_CUSTOM,
+            target_dir_path=target_dir,
+        )
+
+        deadline = time.time() + 3
+        while distributor.get_transfer_info(transfer_id) and time.time() < deadline:
+            time.sleep(0.01)
+
+        start_messages = [msg for msg in sent_messages if msg.get("type") == "file_send_start"]
+        assert start_messages
+        params = start_messages[0]["params"]
+        assert params["target_dir_type"] == TARGET_DIR_CUSTOM
+        assert params["target_dir_path"] == target_dir

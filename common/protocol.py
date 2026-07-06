@@ -15,6 +15,7 @@ class MessageType(Enum):
     BROADCAST_START = "broadcast_start"
     BROADCAST_STOP = "broadcast_stop"
     BROADCAST_FRAME = "broadcast_frame"
+    STUDENT_SCREEN_FRAME = "student_screen_frame"
     NET_CONTROL = "net_control"
     FILE_SEND_START = "file_send_start"
     FILE_SEND_DATA = "file_send_data"

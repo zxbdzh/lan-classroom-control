@@ -1,4 +1,6 @@
 import os
+import base64
+import time
 from typing import List, Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
 from common.tcp_conn import TCPServer, TCPConnection
@@ -34,6 +36,7 @@ class TeacherServer:
         self.on_student_changed: Optional[Callable] = None
         self.on_discovered_student: Optional[Callable] = None
         self.on_discovered_lost: Optional[Callable] = None
+        self.on_student_screen_frame: Optional[Callable] = None
 
         self._setup_callbacks()
 
@@ -81,6 +84,10 @@ class TeacherServer:
                 self.update_server.on_update_request(conn, params)
             elif msg_type == MessageType.UPDATE_PROGRESS:
                 self.update_server.on_update_progress(conn, params)
+            elif msg_type == MessageType.STUDENT_SCREEN_FRAME:
+                self._handle_student_screen_frame(conn, params)
+            elif msg_type == MessageType.COMMAND_ACK:
+                self._handle_command_ack(conn, params)
         except Exception as e:
             logger.error(f"Handle message error from {conn.addr}: {e}")
 
@@ -131,11 +138,36 @@ class TeacherServer:
     def _handle_heartbeat(self, conn: TCPConnection, params: dict):
         if conn.student_id:
             self.heartbeat_manager.record_heartbeat(conn.student_id)
+            self.student_manager.update_heartbeat(conn.student_id)
 
     def _handle_file_ack(self, params: dict):
         transfer_id = params.get("transfer_id", "")
         success = params.get("success", False)
         logger.debug(f"File ack: {transfer_id}, success={success}")
+
+    def _handle_command_ack(self, conn: TCPConnection, params: dict):
+        command = params.get("command", "")
+        if command == "net_control":
+            logger.info("Ignored net_control ack because network control is disabled")
+        return
+
+    def _handle_student_screen_frame(self, conn: TCPConnection, params: dict):
+        student_id = params.get("student_id") or conn.student_id
+        frame_b64 = params.get("frame_data", "")
+        width = params.get("width", 0)
+        height = params.get("height", 0)
+        if not student_id or not frame_b64 or width <= 0 or height <= 0:
+            return
+        try:
+            frame_data = base64.b64decode(frame_b64)
+        except Exception as e:
+            logger.debug(f"Decode student screen frame failed: {e}")
+            return
+        student = self.student_manager.get_student(student_id)
+        if student:
+            student.status["last_screen_frame_time"] = time.time()
+        if self.on_student_screen_frame:
+            self.on_student_screen_frame(student_id, frame_data, (width, height))
 
     def _forward_student_added(self, student: StudentInfo):
         if self.on_student_added:
@@ -206,38 +238,83 @@ class TeacherServer:
         logger.info("Broadcast stopped")
 
     def send_net_control(self, student_ids: List[str], enable: bool, whitelist: List[str] = None):
-        msg = build_message(MessageType.NET_CONTROL, {
-            "enable": enable,
-            "whitelist": whitelist or []
-        })
-        for sid in student_ids:
-            student = self.student_manager.get_student(sid)
-            if student and student.conn and student.conn.is_alive():
-                student.conn.send_message(msg)
-                student.status["net_blocked"] = enable
-        if self.on_student_changed:
-            self.on_student_changed()
+        logger.info(
+            "Network control is disabled; ignored request for %d students, enable=%s",
+            len(student_ids or []),
+            enable,
+        )
 
     def send_net_control_all(self, enable: bool, whitelist: List[str] = None):
         students = self.student_manager.get_online_students()
         sids = [s.student_id for s in students]
         self.send_net_control(sids, enable, whitelist)
 
+    def refresh_connections(self) -> dict:
+        checked = 0
+        refreshed = 0
+        marked_offline = 0
+        probe_msg = build_message(MessageType.STUDENT_HEARTBEAT, {
+            "probe": True,
+            "timestamp": time.time(),
+        })
+
+        for student in self.student_manager.get_all_students():
+            checked += 1
+            conn = student.conn or self.tcp_server.get_connection(student.student_id)
+            alive = bool(conn and conn.is_alive())
+            if student.online and alive:
+                if conn.send_message(probe_msg):
+                    refreshed += 1
+                    self.heartbeat_manager.record_heartbeat(student.student_id)
+                    continue
+                alive = False
+
+            if not alive:
+                if student.online:
+                    self.student_manager.set_student_offline(student.student_id)
+                    self.heartbeat_manager.remove_student(student.student_id)
+                    marked_offline += 1
+                if conn:
+                    conn.stop()
+                if student.ip:
+                    self.discover.send_discover_to(student.ip)
+
+        self.discover.scan_once()
+        logger.info(
+            "Refresh connections: checked=%d, alive=%d, offline=%d",
+            checked,
+            refreshed,
+            marked_offline,
+        )
+        return {
+            "checked": checked,
+            "alive": refreshed,
+            "offline": marked_offline,
+        }
+
     def send_file(self, file_path: str, student_ids: List[str] = None,
-                  progress_callback: Optional[Callable] = None) -> str:
+                  progress_callback: Optional[Callable] = None,
+                  target_dir_type: str = "default",
+                  target_dir_path: str = "") -> str:
         if student_ids is None:
             students = self.student_manager.get_online_students()
         else:
             students = [self.student_manager.get_student(sid) for sid in student_ids
                         if self.student_manager.get_student(sid)]
         return self.file_distributor.send_file_to_students(
-            file_path, students, progress_callback
+            file_path, students, progress_callback,
+            target_dir_type=target_dir_type,
+            target_dir_path=target_dir_path
         )
 
-    def send_file_all(self, file_path: str, progress_callback=None) -> str:
+    def send_file_all(self, file_path: str, progress_callback=None,
+                      target_dir_type: str = "default",
+                      target_dir_path: str = "") -> str:
         students = self.student_manager.get_online_students()
         return self.file_distributor.send_file_to_students(
-            file_path, students, progress_callback
+            file_path, students, progress_callback,
+            target_dir_type=target_dir_type,
+            target_dir_path=target_dir_path
         )
 
     def push_update(self, file_path: str, version: str,

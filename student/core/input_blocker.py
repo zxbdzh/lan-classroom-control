@@ -43,7 +43,10 @@ class InputBlocker:
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            user32.BlockInput(True)
+            result = user32.BlockInput(True)
+            if not result:
+                logger.warning("Windows BlockInput returned false, falling back to pynput")
+                self._block_pynput()
         except Exception as e:
             logger.warning(f"Windows BlockInput failed: {e}, falling back to pynput")
             self._block_pynput()

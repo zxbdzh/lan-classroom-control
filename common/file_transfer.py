@@ -13,6 +13,13 @@ CHUNK_SIZE = 64 * 1024
 FILE_HEADER_FORMAT = "!IIQ"
 FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT)
 
+TARGET_DIR_DEFAULT = "default"
+TARGET_DIR_DESKTOP = "desktop"
+TARGET_DIR_DOWNLOADS = "downloads"
+TARGET_DIR_DOCUMENTS = "documents"
+TARGET_DIR_C_DOWNLOADS = "c_downloads"
+TARGET_DIR_CUSTOM = "custom"
+
 
 class FileTransferSender:
     def __init__(self):
@@ -92,24 +99,29 @@ class FileTransferReceiver:
 
     def handle_start(self, params: dict):
         transfer_id = params["transfer_id"]
-        file_name = params["file_name"]
+        file_name = os.path.basename(params["file_name"]) or transfer_id
         file_size = params["file_size"]
         total_chunks = params["total_chunks"]
         md5 = params.get("md5", "")
+        target_dir = self._resolve_target_dir(
+            params.get("target_dir_type", TARGET_DIR_DEFAULT),
+            params.get("target_dir_path", "")
+        )
 
-        save_path = os.path.join(self.save_dir, file_name)
+        save_path = os.path.join(target_dir, file_name)
         # 文件名冲突自动加序号 (1), (2)...
         if os.path.exists(save_path):
             base, ext = os.path.splitext(file_name)
             i = 1
-            while os.path.exists(os.path.join(self.save_dir, f"{base}({i}){ext}")):
+            while os.path.exists(os.path.join(target_dir, f"{base}({i}){ext}")):
                 i += 1
-            save_path = os.path.join(self.save_dir, f"{base}({i}){ext}")
+            save_path = os.path.join(target_dir, f"{base}({i}){ext}")
             logger.info(f"File name conflict, renamed to: {os.path.basename(save_path)}")
         with self._lock:
             self._active_transfers[transfer_id] = {
                 "file_name": file_name,
                 "save_path": save_path,
+                "target_dir": target_dir,
                 "file_size": file_size,
                 "total_chunks": total_chunks,
                 "received_chunks": 0,
@@ -118,6 +130,32 @@ class FileTransferReceiver:
                 "file": open(save_path, "wb"),
             }
         logger.info(f"Receiving file: {file_name}, size: {file_size}, save to: {save_path}")
+
+    def _resolve_target_dir(self, target_dir_type: str, target_dir_path: str = "") -> str:
+        home_dir = os.path.expanduser("~")
+        target_dir = self.save_dir
+
+        if target_dir_type == TARGET_DIR_DESKTOP:
+            target_dir = os.path.join(home_dir, "Desktop")
+        elif target_dir_type == TARGET_DIR_DOWNLOADS:
+            target_dir = os.path.join(home_dir, "Downloads")
+        elif target_dir_type == TARGET_DIR_DOCUMENTS:
+            target_dir = os.path.join(home_dir, "Documents")
+        elif target_dir_type == TARGET_DIR_C_DOWNLOADS:
+            if os.name == "nt":
+                target_dir = os.path.join("C:\\", "LanClassroom", "Downloads")
+        elif target_dir_type == TARGET_DIR_CUSTOM and target_dir_path:
+            expanded = os.path.expandvars(os.path.expanduser(target_dir_path.strip()))
+            if os.path.isabs(expanded):
+                target_dir = expanded
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            return target_dir
+        except Exception as e:
+            logger.warning(f"Create target dir failed: {target_dir}, fallback to {self.save_dir}, error: {e}")
+            os.makedirs(self.save_dir, exist_ok=True)
+            return self.save_dir
 
     def handle_data(self, params: dict) -> bool:
         transfer_id = params["transfer_id"]

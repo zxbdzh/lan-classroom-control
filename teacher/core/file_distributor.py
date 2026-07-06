@@ -3,6 +3,7 @@ import struct
 import threading
 import uuid
 import base64
+import time
 from typing import Callable, Dict, List, Optional
 from common.protocol import MessageType, build_message
 from common.file_transfer import CHUNK_SIZE, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
@@ -21,7 +22,9 @@ class FileDistributor:
     def send_file_to_students(self, file_path: str, students: List,
                               progress_callback: Optional[Callable] = None,
                               is_update: bool = False,
-                              target_version: str = "") -> str:
+                              target_version: str = "",
+                              target_dir_type: str = "default",
+                              target_dir_path: str = "") -> str:
         transfer_id = str(uuid.uuid4())
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
@@ -41,10 +44,9 @@ class FileDistributor:
             target=self._send_file_worker,
             args=(transfer_id, file_path, file_name, file_size,
                   total_chunks, md5_hex, students, progress_callback,
-                  is_update, target_version),
+                  is_update, target_version, target_dir_type, target_dir_path),
             daemon=True
         )
-        thread.start()
 
         with self._lock:
             self._active_transfers[transfer_id] = {
@@ -54,14 +56,23 @@ class FileDistributor:
                 "students": len(students),
                 "thread": thread,
                 "is_update": is_update,
+                "target_dir_type": target_dir_type,
+                "target_dir_path": target_dir_path,
+                "sent_bytes": 0,
+                "started_at": 0.0,
             }
+        thread.start()
         return transfer_id
 
     def _send_file_worker(self, transfer_id: str, file_path: str, file_name: str,
                           file_size: int, total_chunks: int, md5_hex: str,
                           students: List, progress_callback: Optional[Callable],
-                          is_update: bool = False, target_version: str = ""):
+                          is_update: bool = False, target_version: str = "",
+                          target_dir_type: str = "default", target_dir_path: str = ""):
         try:
+            with self._lock:
+                if transfer_id in self._active_transfers:
+                    self._active_transfers[transfer_id]["started_at"] = time.time()
             start_params = {
                 "transfer_id": transfer_id,
                 "file_name": file_name,
@@ -72,6 +83,9 @@ class FileDistributor:
             if is_update:
                 start_params["is_update"] = True
                 start_params["target_version"] = target_version
+            else:
+                start_params["target_dir_type"] = target_dir_type
+                start_params["target_dir_path"] = target_dir_path
             start_msg = build_message(MessageType.FILE_SEND_START, start_params)
             for student in students:
                 if student.conn and student.conn.is_alive():
@@ -105,6 +119,9 @@ class FileDistributor:
                         progress_callback(transfer_id, sent_bytes, file_size)
                     if self.on_progress:
                         self.on_progress(transfer_id, sent_bytes, file_size)
+                    with self._lock:
+                        if transfer_id in self._active_transfers:
+                            self._active_transfers[transfer_id]["sent_bytes"] = sent_bytes
 
             end_msg = build_message(MessageType.FILE_SEND_END, {
                 "transfer_id": transfer_id,
@@ -121,6 +138,9 @@ class FileDistributor:
 
         except Exception as e:
             logger.error(f"File distribution error: {e}")
+            with self._lock:
+                if transfer_id in self._active_transfers:
+                    self._active_transfers[transfer_id]["error"] = str(e)
             if self.on_complete:
                 self.on_complete(transfer_id, False, str(e))
         finally:

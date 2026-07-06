@@ -4,14 +4,42 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox, QInputDialog, QLineEdit
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
 from PyQt5.QtCore import Qt, QObject, pyqtSignal
+from student.core.access_control import verify_guard_password
 from student.core.student_client import StudentClient
 from student.ui.overlay import OverlayWindow
 from common.logger import get_logger
 
 logger = get_logger("student_app")
+
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """Prevent duplicate student client processes in the same Windows session."""
+    global _SINGLE_INSTANCE_HANDLE
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, False, "Local\\LanClassroomStudentSingleInstance")
+        if not handle:
+            logger.warning(f"CreateMutex failed: {ctypes.get_last_error()}")
+            return True
+        _SINGLE_INSTANCE_HANDLE = handle
+        if ctypes.get_last_error() == 183:
+            logger.info("Student application is already running, exit duplicate process")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Single instance lock failed: {e}")
+        return True
 
 
 class StudentAppUI(QObject):
@@ -52,7 +80,7 @@ class StudentAppUI(QObject):
 
         self._setup_tray()
         self._setup_client_callbacks()
-        self._check_admin_warning()
+        self._show_startup_message()
 
     def _setup_signals(self):
         self.black_screen_changed.connect(self._on_black_screen_changed_ui)
@@ -74,24 +102,6 @@ class StudentAppUI(QObject):
             self.client.on_connected = lambda: self.status_changed.emit("已连接教师端")
             self.client.on_disconnected = lambda: self.status_changed.emit("未连接")
 
-    def _check_admin_warning(self):
-        if not self.client:
-            return
-        if sys.platform == "win32":
-            has_admin = self.client.net_controller.check_admin_privilege()
-            if not has_admin:
-                logger.warning("Student running without administrator privilege")
-                try:
-                    if self.tray and QSystemTrayIcon.supportsMessages():
-                        self.tray.showMessage(
-                            "提示",
-                            "当前未以管理员身份运行，禁用上网等功能可能无法正常工作。\n建议右键选择'以管理员身份运行'。",
-                            QSystemTrayIcon.Information,
-                            5000
-                        )
-                except Exception:
-                    pass
-
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             logger.warning("System tray not available, running without tray icon")
@@ -107,10 +117,24 @@ class StudentAppUI(QObject):
         menu.addSeparator()
         about_action = menu.addAction("关于")
         about_action.triggered.connect(self._on_about)
-        # 学生端不允许通过托盘退出，移除"退出"选项
+        menu.addSeparator()
+        quit_action = menu.addAction("退出学生端")
+        quit_action.triggered.connect(self._on_quit)
 
         self.tray.setContextMenu(menu)
         self.tray.show()
+
+    def _show_startup_message(self):
+        if self.tray and QSystemTrayIcon.supportsMessages():
+            try:
+                self.tray.showMessage(
+                    "学生端已启动",
+                    "局域网机房控制系统学生端正在后台运行，等待教师端连接。",
+                    QSystemTrayIcon.Information,
+                    5000
+                )
+            except Exception:
+                pass
 
     def _create_tray_icon(self):
         pixmap = QPixmap(32, 32)
@@ -211,8 +235,31 @@ class StudentAppUI(QObject):
         )
 
     def _on_quit(self):
-        # 学生端不允许退出，此方法仅作内部兜底
-        logger.warning("Student quit attempted, but student app is not allowed to quit")
+        password, ok = QInputDialog.getText(
+            None,
+            "退出验证",
+            "请输入安装密码：",
+            QLineEdit.Password
+        )
+        if not ok:
+            return
+        if not verify_guard_password(password):
+            QMessageBox.warning(None, "退出验证", "密码错误，已取消退出。")
+            logger.warning("Student quit rejected: invalid password")
+            return
+
+        logger.info("Student quit accepted by password")
+        try:
+            if self.client:
+                self.client.stop()
+        except Exception as e:
+            logger.warning(f"Stop student client before quit failed: {e}")
+        try:
+            if self.tray:
+                self.tray.hide()
+        except Exception:
+            pass
+        self.app.quit()
 
     def run(self):
         try:
@@ -228,6 +275,8 @@ class StudentAppUI(QObject):
 
 def main():
     try:
+        if not acquire_single_instance_lock():
+            sys.exit(0)
         app = StudentAppUI()
         sys.exit(app.run())
     except Exception as e:
