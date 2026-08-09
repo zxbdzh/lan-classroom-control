@@ -1,6 +1,8 @@
 import pytest
 import sys
-from unittest.mock import patch, MagicMock
+import ctypes
+from types import SimpleNamespace
+from unittest.mock import call, patch, MagicMock
 from student.core.input_blocker import InputBlocker
 
 
@@ -52,3 +54,27 @@ class TestInputBlocker:
         assert blocker.is_blocked() is True
         blocker.unblock()
         assert blocker.is_blocked() is False
+
+    def test_windows_fallback_listeners_are_always_stopped(self):
+        blocker = InputBlocker()
+        user32 = MagicMock()
+        user32.BlockInput.side_effect = [False, True]
+        with patch('sys.platform', 'win32'), patch.object(
+            ctypes,
+            'windll',
+            SimpleNamespace(user32=user32),
+            create=True,
+        ), patch.object(
+            blocker, '_block_pynput'
+        ) as fallback, patch.object(
+            blocker, '_unblock_pynput'
+        ) as cleanup:
+            blocker.block()
+            blocker.unblock()
+
+        fallback.assert_called_once_with()
+        cleanup.assert_called_once_with()
+        assert user32.BlockInput.call_args_list == [
+            call(True),
+            call(False),
+        ]

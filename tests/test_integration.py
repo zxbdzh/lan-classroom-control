@@ -1,10 +1,15 @@
 import pytest
+import base64
+import socket
 import time
 import threading
 from unittest.mock import patch, MagicMock
 from teacher.core.teacher_server import TeacherServer
 from student.core.student_client import StudentClient
 from common.protocol import MessageType
+from common.protocol import build_message, serialize_message
+from common.v2.control import AckStage, ControlEnvelope
+from student.core.v2.storage import StudentStateStore
 
 
 @pytest.fixture
@@ -35,6 +40,146 @@ class TestStudentClientBasics:
 
 
 class TestTeacherStudentIntegration:
+    def test_discovery_packet_auto_connects_and_registers_without_credentials(
+        self, teacher_server
+    ):
+        server, tcp_port = teacher_server
+        listener_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener_socket.bind(("127.0.0.1", 0))
+        discovery_port = listener_socket.getsockname()[1]
+        listener_socket.close()
+
+        client = StudentClient(state_store=StudentStateStore(":memory:"))
+        client.tcp_client.auto_reconnect = False
+        client.discover_listener.listen_port = discovery_port
+        client.discover_listener.announce_port = discovery_port
+        registered = threading.Event()
+        server.on_student_added = lambda _student: registered.set()
+        client.discover_listener.start()
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            message = build_message(
+                MessageType.TEACHER_DISCOVER,
+                {"tcp_port": tcp_port, "teacher_name": "Teacher"},
+            )
+            sender.sendto(
+                serialize_message(message),
+                ("127.0.0.1", discovery_port),
+            )
+
+            assert registered.wait(2.0)
+            student = server.student_manager.get_student(client.student_id)
+            assert student is not None
+            assert student.online is True
+        finally:
+            sender.close()
+            client.stop()
+
+    def test_registration_restores_persistent_identity_and_group(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        server.set_identity_resolver(
+            lambda device_id, mac: ("stable-id", "第一组")
+        )
+        connection = MagicMock()
+        connection.addr = ("192.168.10.21", 50000)
+
+        server._handle_student_register(
+            connection,
+            {
+                "student_id": "new-id",
+                "hostname": "PC-21",
+                "mac": "00:11:22:33:44:55",
+                "protocol_version": 2,
+            },
+        )
+
+        student = server.student_manager.get_student("stable-id")
+        assert connection.student_id == "stable-id"
+        assert student is not None
+        assert student.group == "第一组"
+
+    def test_registration_reuses_existing_identity_for_same_mac(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        first_connection = MagicMock()
+        first_connection.addr = ("192.168.10.21", 50000)
+        server._handle_student_register(
+            first_connection,
+            {
+                "student_id": "stable-id",
+                "hostname": "PC-21",
+                "mac": "00:11:22:33:44:55",
+            },
+        )
+        server.set_student_group(["stable-id"], "第一组")
+
+        replacement_connection = MagicMock()
+        replacement_connection.addr = ("192.168.10.21", 50001)
+        server._handle_student_register(
+            replacement_connection,
+            {
+                "student_id": "regenerated-id",
+                "hostname": "PC-21",
+                "mac": "00:11:22:33:44:55",
+            },
+        )
+
+        assert replacement_connection.student_id == "stable-id"
+        assert server.student_manager.get_student("stable-id").group == "第一组"
+        assert server.student_manager.get_student("regenerated-id") is None
+        first_connection.stop.assert_called_once_with()
+
+        server._on_disconnect(first_connection)
+
+        current = server.student_manager.get_student("stable-id")
+        assert current.conn is replacement_connection
+        assert current.online is True
+
+    def test_connection_identity_overrides_stale_payload_identity(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        connection = MagicMock()
+        connection.student_id = "stable-id"
+        connection.addr = ("192.168.10.21", 50000)
+        server.file_distributor.record_ack = MagicMock()
+
+        server._handle_file_ack(connection, {
+            "student_id": "regenerated-id",
+            "transfer_id": "transfer-1",
+            "stage": "end",
+            "success": True,
+        })
+
+        recorded = server.file_distributor.record_ack.call_args.args[0]
+        assert recorded["student_id"] == "stable-id"
+
+        acknowledgements = []
+        server.set_ack_handler(acknowledgements.append)
+        command = ControlEnvelope.command(
+            "silence.start",
+            command_id="5afbcf40-648a-4afd-b6c8-558c551afdd1",
+            device_id="stable-id",
+            revision=7,
+        )
+        ack = ControlEnvelope.ack(
+            command_id=command.command_id,
+            device_id="regenerated-id",
+            revision=command.revision,
+            stage=AckStage.APPLIED,
+        )
+        server._handle_v2_ack(connection, ack.to_dict())
+
+        assert acknowledgements[0].device_id == "stable-id"
+
+        frames = []
+        server.on_student_screen_frame = lambda *args: frames.append(args)
+        server._handle_student_screen_frame(connection, {
+            "student_id": "regenerated-id",
+            "frame_data": base64.b64encode(b"jpeg").decode("ascii"),
+            "width": 320,
+            "height": 180,
+        })
+
+        assert frames == [("stable-id", b"jpeg", (320, 180))]
+
     def test_student_register(self, teacher_server):
         server, tcp_port = teacher_server
         client = StudentClient()

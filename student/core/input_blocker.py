@@ -58,6 +58,9 @@ class InputBlocker:
             user32.BlockInput(False)
         except Exception as e:
             logger.warning(f"Windows UnblockInput failed: {e}")
+        finally:
+            # BlockInput may have fallen back to pynput even though the later
+            # Windows unblock call succeeds.
             self._unblock_pynput()
 
     def _block_pynput(self):

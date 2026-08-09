@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from common.logger import get_logger
 logger = get_logger("net_control")
 
 RULE_NAME_PREFIX = "LanClassroomNetControl"
+RULE_GROUP = "LanClassroomControlV2"
 WEB_PORTS_TCP = "80,443"
 WEB_PORTS_UDP = "443"
 BROWSER_PROCESS_NAMES = [
@@ -58,10 +60,11 @@ class NetController:
 
     def unblock_internet(self) -> bool:
         with self._lock:
-            if not self._blocked:
-                return True
+            was_blocked = self._blocked
         if sys.platform == "win32":
             result = self._unblock_windows()
+        elif not was_blocked:
+            return True
         else:
             result = self._unblock_linux()
         if result:
@@ -108,63 +111,50 @@ class NetController:
             logger.error("Cannot block internet: no administrator privilege")
             return False
 
-        self._cleanup_windows_rules()
-        self._save_windows_firewall_policy()
+        if not self._cleanup_windows_rules():
+            logger.error("Cannot apply network policy: stale classroom rules remain")
+            return False
+        allowed = self._allowed_networks(self._whitelist_ips)
+        for idx, network in enumerate(allowed):
+            for direction in ("out", "in"):
+                if not self._run_cmd([
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={RULE_NAME_PREFIX}_Allow_{direction}_{idx}",
+                    f"dir={direction}",
+                    "action=allow",
+                    "protocol=any",
+                    f"remoteip={network}",
+                    f"group={RULE_GROUP}",
+                    "enable=yes",
+                    "profile=any",
+                ]):
+                    self._cleanup_windows_rules()
+                    return False
 
-        for idx, ip in enumerate(self._normalize_whitelist_ips(self._whitelist_ips)):
-            allow_rule = f"{RULE_NAME_PREFIX}_AllowTeacher_{idx}"
+        external_ranges = self._external_networks(allowed)
+        for idx, remote_ip in enumerate(self._chunk_remote_ips(external_ranges)):
             if not self._run_cmd([
                 "netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={allow_rule}",
+                f"name={RULE_NAME_PREFIX}_BlockExternal_{idx}",
                 "dir=out",
-                "action=allow",
+                "action=block",
                 "protocol=any",
-                f"remoteip={ip}",
+                f"remoteip={remote_ip}",
+                f"group={RULE_GROUP}",
                 "enable=yes",
                 "profile=any",
             ]):
+                self._cleanup_windows_rules()
                 return False
-
-        if not self._add_windows_web_block_rules():
-            return False
-        self._add_windows_browser_block_rules()
-
-        return self._run_cmd([
-            "netsh", "advfirewall", "set", "allprofiles",
-            "firewallpolicy", "blockinbound,blockoutbound"
-        ])
+        return True
 
     def _unblock_windows(self) -> bool:
         if not self._check_admin():
             logger.warning("Cannot fully unblock: no administrator privilege, trying anyway")
 
         restored = self._restore_windows_firewall_policy()
-        self._cleanup_windows_rules()
-        return restored
-
-        try:
-            result = subprocess.run(
-                ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"],
-                capture_output=True, text=True, timeout=15
-            )
-            lines = result.stdout.splitlines()
-            rule_names = []
-            for line in lines:
-                if "规则名称:" in line or "Rule Name:" in line:
-                    name = line.split(":", 1)[1].strip()
-                    if name.startswith(RULE_NAME_PREFIX):
-                        rule_names.append(name)
-
-            success = True
-            for name in rule_names:
-                if not self._run_cmd([
-                    "netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"
-                ]):
-                    success = False
-            return success
-        except Exception as e:
-            logger.error(f"Windows unblock internet failed: {e}")
-            return False
+        cleaned = self._cleanup_windows_rules()
+        return restored and cleaned
 
     def _normalize_whitelist_ips(self, ips: List[str]) -> List[str]:
         result = []
@@ -174,24 +164,124 @@ class NetController:
                 result.append(ip)
         return result
 
+    def _allowed_networks(self, values: List[str]) -> List[str]:
+        defaults = [
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "224.0.0.0/4",
+            "255.255.255.255/32",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
+            "ff00::/8",
+        ]
+        normalized = []
+        for value in defaults + self._normalize_whitelist_ips(values):
+            try:
+                network = ipaddress.ip_network(str(value), strict=False)
+                text = str(network)
+                if text not in normalized:
+                    normalized.append(text)
+            except ValueError:
+                logger.warning(f"Ignore invalid allowed network: {value}")
+        return normalized
+
+    @staticmethod
+    def _external_networks(allowed: List[str]) -> List[str]:
+        result = []
+        for version, universe in (
+            (4, ipaddress.ip_network("0.0.0.0/0")),
+            (6, ipaddress.ip_network("::/0")),
+        ):
+            remaining = [universe]
+            networks = [
+                ipaddress.ip_network(value, strict=False)
+                for value in allowed
+                if ipaddress.ip_network(value, strict=False).version == version
+            ]
+            for allowed_network in networks:
+                next_remaining = []
+                for candidate in remaining:
+                    if not candidate.overlaps(allowed_network):
+                        next_remaining.append(candidate)
+                    elif allowed_network.supernet_of(candidate) or allowed_network == candidate:
+                        continue
+                    elif candidate.supernet_of(allowed_network):
+                        next_remaining.extend(candidate.address_exclude(allowed_network))
+                remaining = next_remaining
+            result.extend(str(network) for network in remaining)
+        return result
+
+    @staticmethod
+    def _chunk_remote_ips(networks: List[str], max_chars: int = 3000) -> List[str]:
+        chunks = []
+        current = []
+        current_length = 0
+        for network in networks:
+            added = len(network) + (1 if current else 0)
+            if current and current_length + added > max_chars:
+                chunks.append(",".join(current))
+                current = []
+                current_length = 0
+            current.append(network)
+            current_length += len(network) + (1 if len(current) > 1 else 0)
+        if current:
+            chunks.append(",".join(current))
+        return chunks
+
     def _cleanup_windows_rules(self) -> bool:
-        known_rules = [
+        self._run_cmd([
+            "netsh", "advfirewall", "firewall", "delete", "rule",
+            "name=all", f"group={RULE_GROUP}",
+        ], log_failure=False)
+        known_rules = {
             f"{RULE_NAME_PREFIX}_BlockAllTCP",
             f"{RULE_NAME_PREFIX}_BlockDNS",
             f"{RULE_NAME_PREFIX}_BlockWebTCP",
             f"{RULE_NAME_PREFIX}_BlockWebUDP",
             f"{RULE_NAME_PREFIX}_BlockDnsUDP",
             f"{RULE_NAME_PREFIX}_BlockDnsTCP",
-        ]
-        known_rules.extend(f"{RULE_NAME_PREFIX}_Allow_{idx}" for idx in range(32))
-        known_rules.extend(f"{RULE_NAME_PREFIX}_AllowTeacher_{idx}" for idx in range(32))
-        known_rules.extend(f"{RULE_NAME_PREFIX}_BlockBrowser_{idx}" for idx in range(128))
+        }
+        enumerated_rules = set()
+        enumeration_ok = True
+        try:
+            result = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            enumeration_ok = result.returncode == 0
+            for line in result.stdout.splitlines():
+                index = line.find(RULE_NAME_PREFIX)
+                if index >= 0:
+                    name = line[index:].strip()
+                    known_rules.add(name)
+                    enumerated_rules.add(name)
+        except Exception as exc:
+            logger.debug(f"Cannot enumerate legacy firewall rules: {exc}")
+            enumeration_ok = False
 
+        success = enumeration_ok
         for name in known_rules:
-            self._run_cmd([
+            removed = self._run_cmd([
                 "netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"
             ], log_failure=False)
-        return True
+            if name in enumerated_rules and not removed:
+                success = False
+        return success
+
+    def restore_stale_rules(self) -> bool:
+        if sys.platform != "win32" or not self._check_admin():
+            return False
+        restored = self._restore_windows_firewall_policy()
+        cleaned = self._cleanup_windows_rules()
+        with self._lock:
+            self._blocked = False
+            self._whitelist_ips = []
+        return restored and cleaned
 
     def _add_windows_web_block_rules(self) -> bool:
         rules = [
@@ -333,6 +423,8 @@ class NetController:
         return policies
 
     def _restore_windows_firewall_policy(self) -> bool:
+        if not os.path.exists(self._state_file):
+            return True
         policies = {
             "domainprofile": "blockinbound,allowoutbound",
             "privateprofile": "blockinbound,allowoutbound",

@@ -2,10 +2,12 @@ import os
 import hashlib
 import threading
 import uuid
+import base64
 from typing import Callable, Dict, List, Optional
 from common.protocol import MessageType, build_message
 from common.file_transfer import CHUNK_SIZE
 from common.logger import get_logger
+from common.update_security import load_public_key, sha256_file, verify_manifest
 
 logger = get_logger("update_server")
 
@@ -28,6 +30,9 @@ class UpdateServer:
         self.update_file_path: Optional[str] = None
         self.update_version: Optional[str] = None
         self.update_md5: Optional[str] = None
+        self.update_sha256: Optional[str] = None
+        self.update_manifest: Optional[bytes] = None
+        self.update_signature: Optional[str] = None
         # 各学生端更新进度: {student_id: {"progress": float, "status": str, "last_update": float}}
         self._progress: Dict[str, dict] = {}
         # 已请求但未完成的学生集合
@@ -43,14 +48,29 @@ class UpdateServer:
             return False
         try:
             md5 = self._compute_file_md5(file_path)
+            sha256 = sha256_file(file_path)
+            with open(file_path + ".manifest.json", "rb") as handle:
+                manifest = handle.read()
+            with open(file_path + ".sig", "rt", encoding="ascii") as handle:
+                signature = handle.read().strip()
+            verify_manifest(
+                manifest,
+                signature,
+                load_public_key(),
+                package_path=file_path,
+                expected_version=version,
+            )
         except Exception as e:
-            logger.error(f"Compute update MD5 failed: {e}")
+            logger.error(f"Update package signature verification failed: {e}")
             return False
         with self._lock:
             self.update_file_path = file_path
             self.update_version = version
             self.update_md5 = md5
-        logger.info(f"Update package set: {file_path}, version={version}, md5={md5}")
+            self.update_sha256 = sha256
+            self.update_manifest = manifest
+            self.update_signature = signature
+        logger.info(f"Update package set: {file_path}, version={version}, sha256={sha256}")
         return True
 
     def clear_update_package(self):
@@ -58,6 +78,9 @@ class UpdateServer:
             self.update_file_path = None
             self.update_version = None
             self.update_md5 = None
+            self.update_sha256 = None
+            self.update_manifest = None
+            self.update_signature = None
             self._progress.clear()
             self._pending.clear()
         logger.info("Update package cleared")
@@ -82,6 +105,7 @@ class UpdateServer:
         msg = build_message(MessageType.UPDATE_CHECK, {
             "version": self.update_version,
             "md5": self.update_md5 or "",
+            "sha256": self.update_sha256 or "",
             "file_name": os.path.basename(self.update_file_path),
         })
         count = 0
@@ -138,6 +162,8 @@ class UpdateServer:
             progress_callback=self._make_progress_callback(student_id),
             is_update=True,
             target_version=self.update_version,
+            update_manifest=base64.b64encode(self.update_manifest or b"").decode("ascii"),
+            update_signature=self.update_signature or "",
         )
         with self._lock:
             self._pending[student_id] = transfer_id

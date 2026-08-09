@@ -3,16 +3,19 @@ import sys
 import struct
 import hashlib
 import base64
+import re
+import shutil
 import threading
 import time
 import zipfile
 import tempfile
-import shutil
+import posixpath
 from typing import Callable, Optional
-from common.version import get_version, is_newer, version_compare, set_version
+from common.version import get_version, is_newer
 from common.file_transfer import CHUNK_SIZE, FILE_HEADER_FORMAT, FILE_HEADER_SIZE
 from common.protocol import MessageType, build_message
 from common.logger import get_logger
+from common.update_security import load_public_key, sha256_file, verify_manifest
 
 logger = get_logger("update_client")
 
@@ -23,12 +26,22 @@ class UpdateClient:
     流程：
     1. 收到 UPDATE_CHECK 通知 -> 对比版本号 -> 需要更新则发送 UPDATE_REQUEST
     2. 教师端通过 FILE_SEND_START/DATA/END 推送更新包（params.is_update=True）
-    3. handle_end 校验 MD5 -> 写入临时 zip -> 生成 updater.bat -> os._exit(0)
-    4. updater.bat 等待主程序退出 -> 解压覆盖 -> 写入 version.txt -> 重启 exe
+    3. handle_end 校验 SHA-256 和 Ed25519 签名并预解压到同盘暂存目录
+    4. updater.bat 停止服务和会话代理，目录级替换并通过 SCM 恢复服务
     """
 
-    def __init__(self, send_message_func: Callable[[dict], None]):
+    SERVICE_NAME = "LanClassroomStudentV2"
+    SERVICE_EXE = "LanClassroom-Student-Service.exe"
+    AGENT_EXE = "LanClassroom-Student-Agent.exe"
+
+    def __init__(
+        self,
+        send_message_func: Callable[[dict], None],
+        *,
+        service_mode: bool = False,
+    ):
         self._send = send_message_func
+        self._service_mode = bool(service_mode)
         self._active_transfer: Optional[dict] = None
         self._lock = threading.Lock()
         self.on_progress: Optional[Callable[[float], None]] = None
@@ -64,13 +77,31 @@ class UpdateClient:
     def handle_start(self, params: dict):
         transfer_id = params.get("transfer_id", "")
         file_name = params.get("file_name", "update.zip")
-        file_size = params.get("file_size", 0)
-        total_chunks = params.get("total_chunks", 0)
+        file_size = int(params.get("file_size", 0))
+        total_chunks = int(params.get("total_chunks", 0))
         md5 = params.get("md5", "")
+        sha256 = params.get("sha256", "")
         target_version = params.get("target_version", "")
+        expected_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        if (
+            not transfer_id
+            or file_size < 0
+            or total_chunks < 0
+            or total_chunks != expected_chunks
+        ):
+            raise ValueError("invalid update transfer metadata")
 
         save_path = os.path.join(self._temp_dir, f"update_{int(time.time())}.zip")
         with self._lock:
+            previous = self._active_transfer
+            if previous:
+                try:
+                    previous["file"].close()
+                finally:
+                    try:
+                        os.remove(previous["save_path"])
+                    except OSError:
+                        pass
             self._active_transfer = {
                 "transfer_id": transfer_id,
                 "file_name": file_name,
@@ -78,7 +109,11 @@ class UpdateClient:
                 "file_size": file_size,
                 "total_chunks": total_chunks,
                 "received_chunks": 0,
+                "received_indices": set(),
                 "md5": md5,
+                "sha256": sha256,
+                "update_manifest": params.get("update_manifest", ""),
+                "update_signature": params.get("update_signature", ""),
                 "target_version": target_version,
                 "file": open(save_path, "wb"),
                 "start_time": time.time(),
@@ -111,20 +146,33 @@ class UpdateClient:
 
         if len(data) < FILE_HEADER_SIZE:
             return False
-        _, idx, chunk_len = struct.unpack(FILE_HEADER_FORMAT, data[:FILE_HEADER_SIZE])
+        version, idx, chunk_len = struct.unpack(
+            FILE_HEADER_FORMAT, data[:FILE_HEADER_SIZE]
+        )
+        if version != 1 or idx != chunk_index or chunk_len > CHUNK_SIZE:
+            return False
         chunk_data = data[FILE_HEADER_SIZE:FILE_HEADER_SIZE + chunk_len]
+        if len(chunk_data) != chunk_len:
+            return False
 
         with self._lock:
-            if not self._active_transfer:
+            transfer = self._active_transfer
+            if not transfer or transfer["transfer_id"] != transfer_id:
                 return False
-            file_obj = self._active_transfer["file"]
+            if chunk_index < 0 or chunk_index >= transfer["total_chunks"]:
+                return False
+            if chunk_index in transfer["received_indices"]:
+                return True
+            file_obj = transfer["file"]
             offset = chunk_index * CHUNK_SIZE
             file_obj.seek(offset)
             file_obj.write(chunk_data)
-            self._active_transfer["received_chunks"] += 1
-            received = self._active_transfer["received_chunks"]
-            total = self._active_transfer["total_chunks"]
-            transfer_id_now = self._active_transfer["transfer_id"]
+            file_obj.flush()
+            transfer["received_indices"].add(chunk_index)
+            transfer["received_chunks"] += 1
+            received = transfer["received_chunks"]
+            total = transfer["total_chunks"]
+            transfer_id_now = transfer["transfer_id"]
 
         if total > 0 and self.on_progress:
             self.on_progress(received / total)
@@ -143,14 +191,38 @@ class UpdateClient:
             file_obj = transfer["file"]
             save_path = transfer["save_path"]
             expected_md5 = transfer.get("md5", "")
+            expected_sha256 = transfer.get("sha256", "")
             target_version = transfer.get("target_version", "")
+            manifest_b64 = transfer.get("update_manifest", "")
+            signature = transfer.get("update_signature", "")
             file_obj.close()
             self._active_transfer = None
+
+        if transfer["received_chunks"] != transfer["total_chunks"]:
+            logger.error("Update transfer is incomplete")
+            self._notify_state("failed", "更新包下载不完整")
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+            return False
+        with open(save_path, "r+b") as handle:
+            handle.truncate(int(transfer["file_size"]))
 
         self._report_progress(transfer_id, 1.0)
 
         # MD5 校验
-        if expected_md5:
+        if expected_sha256:
+            actual_sha256 = sha256_file(save_path)
+            if actual_sha256 != expected_sha256:
+                logger.error("Update SHA-256 mismatch")
+                self._notify_state("failed", "更新包 SHA-256 校验失败")
+                try:
+                    os.remove(save_path)
+                except OSError:
+                    pass
+                return False
+        elif expected_md5:
             actual_md5 = self._compute_file_md5(save_path)
             if actual_md5 != expected_md5:
                 logger.error(f"Update MD5 mismatch: expected {expected_md5}, got {actual_md5}")
@@ -161,6 +233,24 @@ class UpdateClient:
                     pass
                 return False
 
+        try:
+            manifest = base64.b64decode(manifest_b64, validate=True)
+            verify_manifest(
+                manifest,
+                signature,
+                load_public_key(),
+                package_path=save_path,
+                expected_version=target_version,
+            )
+        except Exception as exc:
+            logger.error(f"Update signature verification failed: {exc}")
+            self._notify_state("failed", "更新包签名校验失败")
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+            return False
+
         logger.info(f"Update package verified, applying: {save_path}")
         self._notify_state("installing", "更新包已下载完成，正在安装")
         # 上报完成
@@ -170,35 +260,75 @@ class UpdateClient:
         return self._apply_update(save_path, target_version)
 
     # ------------------------------------------------------------------
-    # 应用更新：生成 updater.bat，主程序退出后由脚本接管
+    # 应用更新：先安全解压，主程序退出后由 updater.bat 切换目录
     # ------------------------------------------------------------------
     def _apply_update(self, zip_path: str, target_version: str) -> bool:
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,63}", target_version or ""):
+            logger.error("Update version contains unsupported characters")
+            self._notify_state("failed", "更新版本号格式无效")
+            return False
         if not zipfile.is_zipfile(zip_path):
             logger.error(f"Update file is not a valid zip: {zip_path}")
             self._notify_state("failed", "更新包格式错误")
             return False
+        members = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                for member in archive.infolist():
+                    normalized = posixpath.normpath(member.filename.replace("\\", "/"))
+                    if (
+                        normalized == ".."
+                        or normalized.startswith("../")
+                        or normalized.startswith("/")
+                        or ":" in normalized.split("/", 1)[0]
+                    ):
+                        raise ValueError("update archive contains an unsafe path")
+                    members.append(normalized)
+        except Exception as exc:
+            logger.error(f"Unsafe update archive: {exc}")
+            self._notify_state("failed", "更新包包含不安全路径")
+            return False
 
-        # 目标目录：exe 所在目录（打包后）或项目根（开发模式）
-        if getattr(sys, 'frozen', False):
-            target_dir = os.path.dirname(sys.executable)
-            program_path = sys.executable
-            restart_cmd = f'"{program_path}"'
-        else:
-            target_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            restart_cmd = f'"{sys.executable}" "{os.path.join(target_dir, "student", "main.py")}"'
+        layout = self._resolve_install_layout()
+        member_keys = {item.casefold() for item in members}
+        service_archive = {
+            "service/{}".format(self.SERVICE_EXE.casefold()),
+            "agent/{}".format(self.AGENT_EXE.casefold()),
+        }.issubset(member_keys)
+        if layout["service_layout"] and not service_archive:
+            logger.error("Student service update is missing Service/Agent directories")
+            self._notify_state("failed", "更新包缺少服务或会话代理目录")
+            return False
 
-        script_path = os.path.join(self._temp_dir, "updater.bat")
+        staging_parent = layout["target_dir"] if layout["service_layout"] else self._temp_dir
+        try:
+            staging_dir = tempfile.mkdtemp(prefix=".update-staging-", dir=staging_parent)
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                archive.extractall(staging_dir)
+        except Exception as exc:
+            logger.error(f"Prepare update staging directory failed: {exc}")
+            self._notify_state("failed", "准备更新暂存目录失败")
+            return False
+
+        script_path = os.path.join(
+            self._temp_dir,
+            "updater_{}_{}.bat".format(os.getpid(), int(time.time() * 1000)),
+        )
         try:
             with open(script_path, "w", encoding="gbk") as f:
                 f.write(self._build_updater_script(
                     zip_path=zip_path,
-                    target_dir=target_dir,
+                    staging_dir=staging_dir,
+                    target_dir=layout["target_dir"],
                     target_version=target_version,
-                    restart_cmd=restart_cmd,
+                    restart_cmd=layout["restart_cmd"],
+                    service_layout=layout["service_layout"],
+                    current_pid=os.getpid(),
                 ))
         except Exception as e:
             logger.error(f"Write updater script failed: {e}")
             self._notify_state("failed", f"生成更新脚本失败: {e}")
+            shutil.rmtree(staging_dir, ignore_errors=True)
             return False
 
         logger.info(f"Update script generated: {script_path}")
@@ -208,14 +338,16 @@ class UpdateClient:
         try:
             import subprocess
             DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
             subprocess.Popen(
                 ["cmd", "/c", script_path],
-                creationflags=DETACHED_PROCESS,
+                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
                 close_fds=True,
             )
         except Exception as e:
             logger.error(f"Launch updater failed: {e}")
             self._notify_state("failed", f"启动更新脚本失败: {e}")
+            shutil.rmtree(staging_dir, ignore_errors=True)
             return False
 
         # 给主程序一点时间刷日志，然后强制退出（不触发 Qt 关闭流程）
@@ -223,50 +355,115 @@ class UpdateClient:
         time.sleep(0.5)
         os._exit(0)
 
-    @staticmethod
-    def _build_updater_script(zip_path: str, target_dir: str,
-                              target_version: str, restart_cmd: str) -> str:
-        """生成 updater.bat 脚本。
+    def _resolve_install_layout(self) -> dict:
+        frozen = bool(getattr(sys, "frozen", False))
+        if not frozen:
+            target_dir = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            return {
+                "target_dir": target_dir,
+                "service_layout": False,
+                "restart_cmd": '"{}" "{}"'.format(
+                    sys.executable, os.path.join(target_dir, "student", "main.py")
+                ),
+            }
 
-        脚本流程：等待主程序退出 -> 解压覆盖 -> 写 version.txt -> 重启程序 -> 自删除
-        """
-        # 用 -wait taskkill 等待主程序结束，最多等 10 秒
-        # Expand-Archive 默认会覆盖（-Force）
-        return f"""@echo off
-chcp 65001 >nul
-echo Applying LanClassroom update...
+        executable = os.path.abspath(sys.executable)
+        executable_dir = os.path.dirname(executable)
+        in_service_dir = os.path.basename(executable_dir).lower() == "service"
+        service_layout = self._service_mode or in_service_dir
+        if service_layout:
+            return {
+                "target_dir": os.path.dirname(executable_dir),
+                "service_layout": True,
+                "restart_cmd": "",
+            }
+        return {
+            "target_dir": executable_dir,
+            "service_layout": False,
+            "restart_cmd": '"{}"'.format(executable),
+        }
 
-REM 等待主程序退出（最多 10 秒）
-set /a wait_count=0
+    @classmethod
+    def _build_updater_script(
+        cls,
+        *,
+        zip_path: str,
+        staging_dir: str,
+        target_dir: str,
+        target_version: str,
+        restart_cmd: str,
+        service_layout: bool,
+        current_pid: int,
+    ) -> str:
+        """Build a Win7-compatible updater with rollback for service installs."""
+        wait_block = f"""set /a wait_count=0
 :wait_loop
-tasklist /fi "PID eq {os.getpid()}" 2>nul | find "{os.getpid()}" >nul
-if not errorlevel 1 (
-    set /a wait_count+=1
-    if {os.getpid()}==0 goto do_update
-    if %wait_count% geq 10 goto do_update
-    timeout /t 1 /nobreak >nul
-    goto wait_loop
-)
+tasklist /fi "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul
+if errorlevel 1 goto do_update
+set /a wait_count+=1
+if %wait_count% geq 30 goto do_update
+ping 127.0.0.1 -n 2 >nul
+goto wait_loop
 
 :do_update
-echo Extracting update package...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '{zip_path}' -DestinationPath '{target_dir}' -Force"
-if errorlevel 1 (
-    echo Update extract failed.
-    timeout /t 5 /nobreak >nul
-    goto cleanup
-)
-
-echo Writing version file...
-echo {target_version}> "{os.path.join(target_dir, 'version.txt')}"
-
-echo Restarting application...
-start "" {restart_cmd}
-
-:cleanup
-REM 自删除脚本
+"""
+        cleanup = f"""rmdir /s /q "{staging_dir}" 2>nul
+del /q "{zip_path}" 2>nul
 (goto) 2>nul & del "%~f0"
 """
+        if not service_layout:
+            return f"""@echo off
+{wait_block}xcopy "{staging_dir}\\*" "{target_dir}\\" /E /I /Y /Q >nul
+if errorlevel 1 goto cleanup
+echo {target_version}> "{os.path.join(target_dir, 'version.txt')}"
+start "" {restart_cmd}
+:cleanup
+{cleanup}"""
+
+        service_dir = os.path.join(target_dir, "Service")
+        agent_dir = os.path.join(target_dir, "Agent")
+        service_backup = os.path.join(target_dir, ".Service.rollback")
+        agent_backup = os.path.join(target_dir, ".Agent.rollback")
+        staged_service = os.path.join(staging_dir, "Service")
+        staged_agent = os.path.join(staging_dir, "Agent")
+        service_exe = os.path.join(service_dir, cls.SERVICE_EXE)
+        agent_exe = os.path.join(agent_dir, cls.AGENT_EXE)
+        return f"""@echo off
+{wait_block}sc stop "{cls.SERVICE_NAME}" >nul 2>&1
+taskkill /IM "{cls.AGENT_EXE}" /F >nul 2>&1
+ping 127.0.0.1 -n 3 >nul
+rmdir /s /q "{service_backup}" 2>nul
+rmdir /s /q "{agent_backup}" 2>nul
+move /Y "{service_dir}" "{service_backup}" >nul
+if errorlevel 1 goto rollback
+move /Y "{agent_dir}" "{agent_backup}" >nul
+if errorlevel 1 goto rollback
+move /Y "{staged_service}" "{service_dir}" >nul
+if errorlevel 1 goto rollback
+move /Y "{staged_agent}" "{agent_dir}" >nul
+if errorlevel 1 goto rollback
+"{service_exe}" --wait 20 start >nul 2>&1
+if errorlevel 1 goto rollback
+echo {target_version}> "{os.path.join(target_dir, 'version.txt')}"
+rmdir /s /q "{service_backup}" 2>nul
+rmdir /s /q "{agent_backup}" 2>nul
+goto cleanup
+
+:rollback
+if exist "{service_backup}" (
+    rmdir /s /q "{service_dir}" 2>nul
+    move /Y "{service_backup}" "{service_dir}" >nul
+)
+if exist "{agent_backup}" (
+    rmdir /s /q "{agent_dir}" 2>nul
+    move /Y "{agent_backup}" "{agent_dir}" >nul
+)
+if exist "{service_exe}" "{service_exe}" --wait 20 start >nul 2>&1
+
+:cleanup
+{cleanup}"""
 
     # ------------------------------------------------------------------
     # 辅助方法

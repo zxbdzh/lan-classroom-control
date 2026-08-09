@@ -1,1136 +1,982 @@
-import os
-import threading
+"""v2 teacher console: seat-first classroom operations for 20-60 PCs."""
 
+from __future__ import annotations
+
+import csv
+import json
+import os
+import ntpath
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from PyQt5.QtCore import QObject, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QToolBar, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
-    QLabel, QStatusBar, QFileDialog, QMessageBox, QMenu, QInputDialog,
-    QGridLayout, QScrollArea, QFrame, QPushButton, QTabWidget, QAbstractItemView,
-    QAction, QSlider, QSizePolicy, QRubberBand
+    QAbstractItemView,
+    QApplication,
+    QButtonGroup,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QStackedWidget,
+    QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QRect, QPoint, QEvent
-from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QBrush
-from typing import List, Optional, Dict, Tuple
-from teacher.core.teacher_server import TeacherServer
-from teacher.core.student_manager import StudentInfo
+
+from common.config import get_config
 from common.logger import get_logger
+from common.v2.model import (
+    ClassroomAction,
+    CommandKind,
+    DeviceIds,
+    InspectionMode,
+    TargetScope,
+)
+from teacher.core.runtime import TeacherRuntime
+from teacher.ui.theme import stylesheet
+from teacher.ui.widgets import (
+    FullScreenViewer,
+    OperationDrawer,
+    PatrolCard,
+    SeatMapWidget,
+)
 
 logger = get_logger("teacher_ui")
 
 
-class StudentThumbWidget(QFrame):
-    def __init__(self, student: StudentInfo, parent=None):
-        super().__init__(parent)
-        self.student = student
-        self._setup_ui()
-
-    def _setup_ui(self):
-        self.setFrameShape(QFrame.Box)
-        self.setLineWidth(1)
-        self.setStyleSheet("""
-            QFrame {
-                background: #2a2a2a;
-                border: 1px solid #444;
-                border-radius: 4px;
-            }
-            QFrame:hover {
-                border: 1px solid #0078d4;
-            }
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        self.screen_label = QLabel()
-        self.screen_label.setMinimumSize(160, 120)
-        self.screen_label.setAlignment(Qt.AlignCenter)
-        self.screen_label.setStyleSheet("background: #101010; color: #bdbdbd;")
-        self.screen_label.setText("无画面")
-        layout.addWidget(self.screen_label)
-
-        self.name_label = QLabel(self.student.display_name)
-        self.name_label.setAlignment(Qt.AlignCenter)
-        self.name_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
-        layout.addWidget(self.name_label)
-
-        self.status_label = QLabel()
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 10px;")
-        self._update_status()
-        layout.addWidget(self.status_label)
-
-    def _update_status(self):
-        statuses = []
-        if not self.student.online:
-            self.status_label.setStyleSheet("color: #b8b8b8; font-size: 10px;")
-            statuses.append("离线")
-        else:
-            self.status_label.setStyleSheet("color: #35d06f; font-size: 10px;")
-            statuses.append("在线")
-        if self.student.status.get("black_screen"):
-            statuses.append("黑屏")
-        if self.student.status.get("broadcasting"):
-            statuses.append("广播中")
-        self.status_label.setText(" | ".join(statuses))
-
-    def update_student(self, student: StudentInfo):
-        self.student = student
-        self.name_label.setText(student.display_name)
-        self._update_status()
-
-    def update_frame(self, frame_data: bytes):
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(frame_data):
-            return
-        scaled = pixmap.scaled(
-            self.screen_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-        self.screen_label.setPixmap(scaled)
-        self.screen_label.setText("")
-
-
-class ScreenWallThumbWidget(QFrame):
-    clicked = pyqtSignal(object, object)
-
-    def __init__(self, student: StudentInfo, zoom: int = 100, parent=None):
-        super().__init__(parent)
-        self.student = student
-        self._zoom = zoom
-        self._last_pixmap = QPixmap()
-        self._selected = False
-        self._setup_ui()
-        self.set_zoom(zoom)
-
-    def _setup_ui(self):
-        self.setObjectName("screenWallThumb")
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._apply_card_style()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        self.screen_label = QLabel()
-        self.screen_label.setAlignment(Qt.AlignCenter)
-        self.screen_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.screen_label.setStyleSheet("""
-            background: #101010;
-            color: #bdbdbd;
-            border: 1px solid #343434;
-            border-radius: 4px;
-        """)
-        self.screen_label.setText("无画面")
-        layout.addWidget(self.screen_label)
-
-        info_row = QHBoxLayout()
-        info_row.setContentsMargins(0, 0, 0, 0)
-        info_row.setSpacing(6)
-
-        self.name_label = QLabel(self.student.display_name)
-        self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.name_label.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: bold;")
-        info_row.addWidget(self.name_label, 1)
-
-        self.status_label = QLabel()
-        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        info_row.addWidget(self.status_label)
-        layout.addLayout(info_row)
-
-        self._update_status()
-
-    def _update_status(self):
-        statuses = []
-        if not self.student.online:
-            self.status_label.setStyleSheet("color: #b8b8b8; font-size: 11px;")
-            statuses.append("离线")
-        else:
-            self.status_label.setStyleSheet("color: #35d06f; font-size: 11px;")
-            statuses.append("在线")
-        if self.student.status.get("black_screen"):
-            statuses.append("黑屏")
-        if self.student.status.get("broadcasting"):
-            statuses.append("广播")
-        self.status_label.setText(" | ".join(statuses))
-
-    def update_student(self, student: StudentInfo):
-        self.student = student
-        self.name_label.setText(student.display_name)
-        self._update_status()
-
-    def set_selected(self, selected: bool):
-        if self._selected == selected:
-            return
-        self._selected = selected
-        self._apply_card_style()
-
-    def _apply_card_style(self):
-        border = "#2d8cff" if self._selected else "#3f3f3f"
-        background = "#263247" if self._selected else "#242424"
-        self.setStyleSheet(f"""
-            QFrame#screenWallThumb {{
-                background: {background};
-                border: 2px solid {border};
-                border-radius: 6px;
-            }}
-            QFrame#screenWallThumb:hover {{
-                border: 2px solid #2d8cff;
-            }}
-        """)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.student.student_id, event)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def update_frame(self, frame_data: bytes):
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(frame_data):
-            return
-        self._last_pixmap = pixmap
-        self._render_frame()
-
-    def set_zoom(self, zoom: int):
-        self._zoom = zoom
-        card_width = max(190, int(260 * zoom / 100))
-        preview_width = card_width - 16
-        preview_height = max(100, int(preview_width * 9 / 16))
-        card_height = preview_height + 52
-        self.setFixedSize(card_width, card_height)
-        self.screen_label.setFixedSize(preview_width, preview_height)
-        self._render_frame()
-
-    def card_width(self) -> int:
-        return self.width() or max(190, int(260 * self._zoom / 100))
-
-    def _render_frame(self):
-        if self._last_pixmap.isNull():
-            return
-        scaled = self._last_pixmap.scaled(
-            self.screen_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.FastTransformation
-        )
-        self.screen_label.setPixmap(scaled)
-        self.screen_label.setText("")
+class UiBridge(QObject):
+    transfer_progress = pyqtSignal(str, int, int)
+    transfer_complete = pyqtSignal(str, bool, str)
 
 
 class TeacherMainWindow(QMainWindow):
-    student_added = pyqtSignal(object)
-    student_removed = pyqtSignal(object)
-    student_changed = pyqtSignal()
-    discovered_student = pyqtSignal(object)
-    discovered_lost = pyqtSignal(object)
-    student_screen_frame = pyqtSignal(object, object, object)
-    file_transfer_progress = pyqtSignal(object, object, object)
-    file_transfer_complete = pyqtSignal(object, object, object)
-    connection_refresh_complete = pyqtSignal(object)
+    NAV_ITEMS = (
+        ("教室", "classroom"),
+        ("巡视", "inspection"),
+        ("文件", "files"),
+        ("应用策略", "policies"),
+        ("设备维护", "maintenance"),
+        ("操作记录", "audit"),
+        ("设置", "settings"),
+    )
 
-    def __init__(self):
+    def __init__(self, runtime: Optional[TeacherRuntime] = None, auto_start: bool = True):
         super().__init__()
-        self.server = TeacherServer()
-        self._selected_students = set()
-        self._thumb_widgets = {}
-        self._discovered_cache: Dict[str, dict] = {}
-        self._wall_zoom = 100
-        self._wall_cols = 0
-        self._wall_rubber_band = None
-        self._wall_drag_origin = QPoint()
-        self._syncing_selection = False
-        self._file_transfers: Dict[str, dict] = {}
-        self._setup_ui()
-        self._setup_callbacks()
-        self.server.start()
-        self._update_status_bar()
+        self.config = get_config()
+        self.runtime = runtime or TeacherRuntime()
+        self._owns_runtime = runtime is None
+        self._last_revision = -1
+        self._snapshot = None
+        self._selected_ids = set()
+        self._device_signature = None
+        self._patrol_cards: Dict[str, PatrolCard] = {}
+        self._patrol_target_ids = set()
+        self._viewers: Dict[str, FullScreenViewer] = {}
+        self._file_rows: Dict[str, int] = {}
+        self._process_command_id = None
+        self._active_page = "classroom"
+        self.bridge = UiBridge()
 
-    def _setup_ui(self):
-        self.setWindowTitle("局域网机房控制系统 - 教师端")
-        self.resize(1200, 800)
-        self.setMinimumSize(800, 600)
+        self.setWindowTitle("局域网机房控制系统 · 教师端")
+        self.setMinimumSize(1000, 600)
+        self.resize(1440, 860)
+        self._build_ui()
+        self._connect_runtime()
+        self.apply_theme(str(self.config.get("ui.theme", "light")))
 
-        self._create_toolbar()
-        self._create_central_widget()
-        self._create_status_bar()
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(350)
+        self.poll_timer.timeout.connect(self._poll_runtime)
+        self.poll_timer.start()
+        if auto_start:
+            try:
+                self.runtime.start()
+            except Exception as exc:
+                logger.error(f"Teacher runtime start failed: {exc}")
+                QMessageBox.critical(self, "启动失败", f"教师服务无法启动：\n{exc}")
 
-        self.setStyleSheet("""
-            QMainWindow {
-                background: #1e1e1e;
-            }
-            QToolBar {
-                background: #2d2d2d;
-                border: none;
-                padding: 4px;
-                spacing: 4px;
-            }
-            QToolButton {
-                background: #3a3a3a;
-                color: #f5f5f5;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                margin: 2px;
-            }
-            QToolButton:hover {
-                background: #0078d4;
-            }
-            QToolButton:checked {
-                background: #0078d4;
-            }
-            QListWidget, QTreeWidget {
-                background: #252525;
-                color: #f5f5f5;
-                border: 1px solid #333;
-            }
-            QHeaderView::section {
-                background: #f2f2f2;
-                color: #111;
-                border: 1px solid #cfcfcf;
-                padding: 4px;
-            }
-            QListWidget::item:selected, QTreeWidget::item:selected {
-                background: #0078d4;
-                color: #fff;
-            }
-            QTabWidget::pane {
-                border: 1px solid #333;
-                background: #252525;
-            }
-            QTabBar::tab {
-                background: #2d2d2d;
-                color: #d6d6d6;
-                padding: 8px 16px;
-                border: 1px solid #333;
-                border-bottom: none;
-            }
-            QTabBar::tab:selected {
-                background: #252525;
-                color: #fff;
-            }
-            QPushButton {
-                background: #0078d4;
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background: #1086e0;
-            }
-            QPushButton:disabled {
-                background: #555;
-                color: #888;
-            }
-            QStatusBar {
-                background: #2d2d2d;
-                color: #f0f0f0;
-            }
-            QLabel {
-                color: #f2f2f2;
-            }
-            QScrollArea {
-                background: #1e1e1e;
-                border: none;
-            }
-            QMessageBox {
-                background: #f6f6f6;
-            }
-            QMessageBox QLabel {
-                color: #202020;
-                background: transparent;
-                font-size: 13px;
-            }
-            QMessageBox QPushButton {
-                background: #0078d4;
-                color: white;
-                min-width: 72px;
-                padding: 6px 14px;
-            }
-        """)
+    def _build_ui(self) -> None:
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-    def _create_toolbar(self):
-        toolbar = QToolBar("主工具栏")
-        toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(24, 24))
-        self.addToolBar(toolbar)
-
-        action_broadcast = QAction("开始广播", self)
-        action_broadcast.triggered.connect(self._on_start_broadcast)
-        toolbar.addAction(action_broadcast)
-
-        action_stop_broadcast = QAction("停止广播", self)
-        action_stop_broadcast.triggered.connect(self._on_stop_broadcast)
-        toolbar.addAction(action_stop_broadcast)
-
-        toolbar.addSeparator()
-
-        action_black = QAction("黑屏肃静", self)
-        action_black.triggered.connect(self._on_black_screen)
-        toolbar.addAction(action_black)
-
-        action_unblack = QAction("解除黑屏", self)
-        action_unblack.triggered.connect(self._on_unblack_screen)
-        toolbar.addAction(action_unblack)
-
-        action_send_file = QAction("发送文件", self)
-        action_send_file.triggered.connect(self._on_send_file)
-        toolbar.addAction(action_send_file)
-
-        action_push_update = QAction("推送更新", self)
-        action_push_update.triggered.connect(self._on_push_update)
-        toolbar.addAction(action_push_update)
-
-        toolbar.addSeparator()
-
-        action_scan = QAction("扫描设备", self)
-        action_scan.triggered.connect(self._on_scan_devices)
-        toolbar.addAction(action_scan)
-
-        action_refresh = QAction("刷新连接", self)
-        action_refresh.triggered.connect(self._on_refresh_connections)
-        toolbar.addAction(action_refresh)
-
-    def _create_central_widget(self):
-        splitter = QSplitter(Qt.Horizontal)
-
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.setSpacing(8)
-
-        self.left_tabs = QTabWidget()
-
-        student_tab = QWidget()
-        student_layout = QVBoxLayout(student_tab)
-        student_layout.setContentsMargins(4, 4, 4, 4)
-
-        title = QLabel("学生列表")
-        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
-        student_layout.addWidget(title)
-
-        self.student_tree = QTreeWidget()
-        self.student_tree.setHeaderLabels(["学生", "状态"])
-        self.student_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.student_tree.itemSelectionChanged.connect(self._on_selection_changed)
-        self.student_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.student_tree.customContextMenuRequested.connect(self._on_student_context_menu)
-        student_layout.addWidget(self.student_tree)
-
-        self.left_tabs.addTab(student_tab, "学生列表")
-
-        discover_tab = QWidget()
-        discover_layout = QVBoxLayout(discover_tab)
-        discover_layout.setContentsMargins(4, 4, 4, 4)
-        discover_layout.setSpacing(6)
-
-        discover_header = QHBoxLayout()
-        discover_title = QLabel("待添加设备")
-        discover_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
-        discover_header.addWidget(discover_title)
-        discover_header.addStretch()
-        self.btn_add_selected = QPushButton("添加选中")
-        self.btn_add_selected.clicked.connect(self._on_add_selected_devices)
-        self.btn_add_selected.setEnabled(False)
-        discover_header.addWidget(self.btn_add_selected)
-        discover_layout.addLayout(discover_header)
-
-        self.discover_list = QListWidget()
-        self.discover_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.discover_list.itemSelectionChanged.connect(self._on_discover_selection_changed)
-        self.discover_list.itemDoubleClicked.connect(self._on_discover_double_click)
-        discover_layout.addWidget(self.discover_list)
-
-        self.discover_status = QLabel("扫描中...")
-        self.discover_status.setStyleSheet("color: #888; font-size: 11px;")
-        discover_layout.addWidget(self.discover_status)
-
-        self.left_tabs.addTab(discover_tab, "扫描设备")
-
-        left_layout.addWidget(self.left_tabs)
-
-        splitter.addWidget(left_panel)
-        splitter.setStretchFactor(0, 1)
-
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.setSpacing(8)
-
-        right_title = QLabel("屏幕墙")
-        right_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ddd;")
-        right_layout.addWidget(right_title)
-
-        wall_controls = QHBoxLayout()
-        wall_controls.setContentsMargins(0, 0, 0, 0)
-        wall_controls.setSpacing(8)
-
-        self.wall_summary_label = QLabel("0 台在线")
-        self.wall_summary_label.setStyleSheet("color: #888; font-size: 12px;")
-        wall_controls.addWidget(self.wall_summary_label)
-        wall_controls.addStretch()
-
-        zoom_title = QLabel("缩放")
-        zoom_title.setStyleSheet("color: #aaa; font-size: 12px;")
-        wall_controls.addWidget(zoom_title)
-
-        self.wall_zoom_slider = QSlider(Qt.Horizontal)
-        self.wall_zoom_slider.setRange(70, 180)
-        self.wall_zoom_slider.setSingleStep(10)
-        self.wall_zoom_slider.setPageStep(10)
-        self.wall_zoom_slider.setValue(self._wall_zoom)
-        self.wall_zoom_slider.setFixedWidth(150)
-        self.wall_zoom_slider.valueChanged.connect(self._on_wall_zoom_changed)
-        wall_controls.addWidget(self.wall_zoom_slider)
-
-        self.wall_zoom_label = QLabel(f"{self._wall_zoom}%")
-        self.wall_zoom_label.setMinimumWidth(42)
-        self.wall_zoom_label.setStyleSheet("color: #ddd; font-size: 12px;")
-        wall_controls.addWidget(self.wall_zoom_label)
-
-        right_layout.addLayout(wall_controls)
-
-        self.wall_scroll = QScrollArea()
-        self.wall_scroll.setWidgetResizable(True)
-        self.wall_widget = QWidget()
-        self.wall_widget.setStyleSheet("background: #1e1e1e;")
-        self.wall_layout = QGridLayout(self.wall_widget)
-        self.wall_layout.setSpacing(10)
-        self.wall_layout.setContentsMargins(8, 8, 8, 8)
-        self.wall_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.wall_widget.installEventFilter(self)
-        self.wall_scroll.setWidget(self.wall_widget)
-        right_layout.addWidget(self.wall_scroll)
-
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(1, 3)
-
-        splitter.setSizes([250, 950])
-        self.setCentralWidget(splitter)
-
-    def _create_status_bar(self):
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-
-        self.status_label = QLabel("初始化中...")
-        self.status_bar.addWidget(self.status_label)
-
-        self.transfer_label = QLabel("")
-        self.transfer_label.setMinimumWidth(260)
-        self.transfer_label.setStyleSheet("color: #ddd;")
-        self.status_bar.addPermanentWidget(self.transfer_label)
-
-    def _setup_callbacks(self):
-        self.server.on_student_added = self.student_added.emit
-        self.server.on_student_removed = self.student_removed.emit
-        self.server.on_student_changed = self.student_changed.emit
-        self.server.on_discovered_student = self.discovered_student.emit
-        self.server.on_discovered_lost = self.discovered_lost.emit
-        self.server.on_student_screen_frame = self.student_screen_frame.emit
-        self.server.file_distributor.on_progress = self.file_transfer_progress.emit
-        self.server.file_distributor.on_complete = self.file_transfer_complete.emit
-
-        self.student_added.connect(self._on_student_added)
-        self.student_removed.connect(self._on_student_removed)
-        self.student_changed.connect(self._on_student_changed)
-        self.discovered_student.connect(self._on_discovered_student)
-        self.discovered_lost.connect(self._on_discovered_lost)
-        self.student_screen_frame.connect(self._on_student_screen_frame)
-        self.file_transfer_progress.connect(self._on_file_transfer_progress)
-        self.file_transfer_complete.connect(self._on_file_transfer_complete)
-        self.connection_refresh_complete.connect(self._on_connection_refresh_complete)
-
-    def _on_student_added(self, student: StudentInfo):
-        sid = student.student_id
-        if sid in self._discovered_cache:
-            del self._discovered_cache[sid]
-            self._refresh_discover_list()
-        self._refresh_student_list()
-        self._refresh_screen_wall()
-        self._update_status_bar()
-
-    def _on_student_removed(self, student: StudentInfo):
-        self._refresh_student_list()
-        self._refresh_screen_wall()
-        self._update_status_bar()
-
-    def _on_student_changed(self):
-        self._refresh_student_list()
-        self._refresh_screen_wall_status()
-
-    def _refresh_student_list(self):
-        self.student_tree.clear()
-        groups = self.server.student_manager.get_groups()
-        for group in groups:
-            group_item = QTreeWidgetItem(self.student_tree, [group, ""])
-            students = self.server.student_manager.get_students_by_group(group)
-            online_count = sum(1 for s in students if s.online)
-            group_item.setText(1, f"{online_count}/{len(students)}")
-            for student in students:
-                status = "在线" if student.online else "离线"
-                if student.status.get("black_screen"):
-                    status += " 黑屏"
-                if student.status.get("broadcasting"):
-                    status += " 广播"
-                item = QTreeWidgetItem(group_item, [student.display_name, status])
-                item.setData(0, Qt.UserRole, student.student_id)
-                if not student.online:
-                    item.setForeground(0, QBrush(QColor("#888")))
-        self.student_tree.expandAll()
-        self._sync_tree_selection_from_selected()
-
-    def _refresh_screen_wall(self):
-        self._clear_wall_layout()
-        self._thumb_widgets.clear()
-
-        students = self.server.student_manager.get_all_students()
-        cols = self._calculate_wall_columns()
-        for idx, student in enumerate(students):
-            thumb = ScreenWallThumbWidget(student, zoom=self._wall_zoom)
-            thumb.clicked.connect(self._on_wall_thumb_clicked)
-            thumb.setContextMenuPolicy(Qt.CustomContextMenu)
-            thumb.customContextMenuRequested.connect(
-                lambda pos, sid=student.student_id, widget=thumb:
-                    self._on_wall_context_menu(widget.mapToGlobal(pos), sid)
-            )
-            thumb.set_selected(student.student_id in self._selected_students)
-            row = idx // cols
-            col = idx % cols
-            self.wall_layout.addWidget(thumb, row, col)
-            self._thumb_widgets[student.student_id] = thumb
-        self._wall_cols = cols
-        self._update_wall_summary()
-
-    def _refresh_screen_wall_status(self):
-        students = self.server.student_manager.get_all_students()
-        for student in students:
-            if student.student_id in self._thumb_widgets:
-                thumb = self._thumb_widgets[student.student_id]
-                thumb.update_student(student)
-                thumb.set_selected(student.student_id in self._selected_students)
-        self._update_wall_summary()
-
-    def _on_student_screen_frame(self, student_id: str, frame_data: bytes, frame_size: tuple):
-        thumb = self._thumb_widgets.get(student_id)
-        if thumb:
-            thumb.update_frame(frame_data)
-
-    def _on_file_transfer_progress(self, transfer_id: str, sent_bytes: int, total_bytes: int):
-        info = self._file_transfers.setdefault(transfer_id, {
-            "file_name": "文件",
-            "target_count": 0,
-        })
-        info["sent_bytes"] = int(sent_bytes)
-        info["total_bytes"] = int(total_bytes)
-        info["status"] = "sending"
-        self._update_transfer_status_label(transfer_id)
-
-    def _on_file_transfer_complete(self, transfer_id: str, success: bool, error: str):
-        info = self._file_transfers.setdefault(transfer_id, {
-            "file_name": "文件",
-            "target_count": 0,
-        })
-        info["status"] = "done" if success else "failed"
-        info["error"] = error
-        self._update_transfer_status_label(transfer_id)
-        QTimer.singleShot(6000, self._clear_completed_transfer_status)
-
-    def _register_file_transfer(self, transfer_id: str, file_path: str, target_count: int):
-        old_info = self._file_transfers.get(transfer_id, {})
-        if old_info.get("status") in {"done", "failed"}:
-            return
-        self._file_transfers[transfer_id] = {
-            "file_name": os.path.basename(file_path),
-            "target_count": target_count,
-            "sent_bytes": old_info.get("sent_bytes", 0),
-            "total_bytes": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
-            "status": old_info.get("status", "sending"),
-            "error": old_info.get("error", ""),
+        outer.addWidget(self._build_sidebar())
+        work = QWidget()
+        work_layout = QVBoxLayout(work)
+        work_layout.setContentsMargins(0, 0, 0, 0)
+        work_layout.setSpacing(0)
+        work_layout.addWidget(self._build_command_bar())
+        self.pages = QStackedWidget()
+        self.page_indexes = {}
+        builders = {
+            "classroom": self._build_classroom_page,
+            "inspection": self._build_inspection_page,
+            "files": self._build_files_page,
+            "policies": self._build_policy_page,
+            "maintenance": self._build_maintenance_page,
+            "audit": self._build_audit_page,
+            "settings": self._build_settings_page,
         }
-        self._update_transfer_status_label(transfer_id)
+        for key, builder in builders.items():
+            self.page_indexes[key] = self.pages.addWidget(builder())
+        work_layout.addWidget(self.pages, 1)
+        outer.addWidget(work, 1)
+        self.operation_drawer = OperationDrawer()
+        outer.addWidget(self.operation_drawer)
 
-    def _update_transfer_status_label(self, transfer_id: str):
-        info = self._file_transfers.get(transfer_id)
-        if not info or not hasattr(self, "transfer_label"):
-            return
-        total = max(0, int(info.get("total_bytes", 0)))
-        sent = max(0, int(info.get("sent_bytes", 0)))
-        percent = int(sent * 100 / total) if total > 0 else 0
-        target_count = int(info.get("target_count", 0))
-        file_name = info.get("file_name", "文件")
-        status = info.get("status", "sending")
-        if status == "done":
-            self.transfer_label.setText(f"文件传输完成: {file_name} -> {target_count} 台")
-        elif status == "failed":
-            self.transfer_label.setText(f"文件传输失败: {file_name} {info.get('error', '')}")
-        else:
-            self.transfer_label.setText(f"正在传输: {file_name} {percent}% -> {target_count} 台")
+        status = QStatusBar()
+        self.connection_status = QLabel("0 台在线")
+        self.scope_status = QLabel("作用域：全班")
+        self.operation_status = QLabel("就绪")
+        self.operation_status.setProperty("muted", True)
+        status.addWidget(self.connection_status)
+        status.addWidget(self.scope_status)
+        status.addPermanentWidget(self.operation_status, 1)
+        self.setStatusBar(status)
 
-    def _clear_completed_transfer_status(self):
-        if not hasattr(self, "transfer_label"):
-            return
-        active = [
-            (tid, info) for tid, info in self._file_transfers.items()
-            if info.get("status") == "sending"
-        ]
-        if active:
-            self._update_transfer_status_label(active[-1][0])
-        else:
-            self.transfer_label.setText("")
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(184)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(12, 16, 12, 14)
+        layout.setSpacing(5)
+        brand = QLabel("机房控制台")
+        brand.setObjectName("Brand")
+        brand.setContentsMargins(8, 4, 0, 14)
+        layout.addWidget(brand)
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        for index, (label, key) in enumerate(self.NAV_ITEMS):
+            button = QPushButton(label)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setProperty("page", key)
+            button.clicked.connect(lambda _checked, value=key: self._show_page(value))
+            self.nav_group.addButton(button)
+            layout.addWidget(button)
+            if index == 0:
+                button.setChecked(True)
+        layout.addStretch()
+        self.version_label = QLabel("v2.0.0")
+        self.version_label.setProperty("muted", True)
+        self.version_label.setContentsMargins(8, 0, 0, 0)
+        layout.addWidget(self.version_label)
+        return sidebar
 
-    def _on_wall_zoom_changed(self, value: int):
-        self._wall_zoom = value
-        self.wall_zoom_label.setText(f"{value}%")
-        for thumb in self._thumb_widgets.values():
-            thumb.set_zoom(value)
-        self._relayout_screen_wall()
+    def _build_command_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("CommandBar")
+        bar.setFixedHeight(62)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.setSpacing(8)
+        scope_label = QLabel("作用域")
+        scope_label.setProperty("muted", True)
+        layout.addWidget(scope_label)
+        self.scope_group = QButtonGroup(self)
+        self.scope_group.setExclusive(True)
+        self.scope_buttons = {}
+        for key, label in (("all", "全班"), ("group", "分组"), ("selected", "已选")):
+            button = QPushButton(label)
+            button.setObjectName("ScopeButton")
+            button.setCheckable(True)
+            button.clicked.connect(self._scope_changed)
+            self.scope_group.addButton(button)
+            self.scope_buttons[key] = button
+            layout.addWidget(button)
+        self.scope_buttons["all"].setChecked(True)
+        self.group_combo = QComboBox()
+        self.group_combo.setFixedWidth(120)
+        self.group_combo.setVisible(False)
+        self.group_combo.currentTextChanged.connect(self._scope_changed)
+        layout.addWidget(self.group_combo)
+        layout.addSpacing(8)
+        layout.addWidget(self._vertical_divider())
+        actions = (
+            ("开始广播", self._start_broadcast, True, False),
+            ("停止广播", self._stop_broadcast, False, False),
+            ("黑屏肃静", self._start_silence, False, False),
+            ("禁止外网", self._block_network, False, False),
+            ("全部恢复", self._restore_all, False, True),
+        )
+        for text, callback, primary, danger in actions:
+            button = QPushButton(text)
+            button.setProperty("primary", primary)
+            button.setProperty("danger", danger)
+            button.clicked.connect(callback)
+            layout.addWidget(button)
+        layout.addStretch()
+        self.drawer_button = QPushButton("操作")
+        self.drawer_button.setCheckable(True)
+        self.drawer_button.setChecked(True)
+        self.drawer_button.toggled.connect(self.operation_drawer_visibility)
+        layout.addWidget(self.drawer_button)
+        return bar
 
-    def _calculate_wall_columns(self) -> int:
-        viewport_width = max(1, self.wall_scroll.viewport().width() - 20)
-        card_width = max(190, int(260 * self._wall_zoom / 100))
-        spacing = self.wall_layout.spacing()
-        return max(1, viewport_width // (card_width + spacing))
+    def _page_shell(self, title: str, right_widget: QWidget = None):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 16, 20, 18)
+        layout.setSpacing(12)
+        header = QWidget()
+        header.setObjectName("PageHeader")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(title)
+        label.setObjectName("PageTitle")
+        row.addWidget(label)
+        row.addStretch()
+        if right_widget:
+            row.addWidget(right_widget)
+        layout.addWidget(header)
+        return page, layout
 
-    def _relayout_screen_wall(self):
-        students = self.server.student_manager.get_all_students()
-        if not students:
-            self._update_wall_summary()
-            return
-        cols = self._calculate_wall_columns()
-        if cols == self._wall_cols and self.wall_layout.count() == len(students):
-            self._update_wall_summary()
-            return
+    def _build_classroom_page(self) -> QWidget:
+        search = QLineEdit()
+        search.setPlaceholderText("搜索主机名或 IP")
+        search.setFixedWidth(240)
+        search.textChanged.connect(self._refresh_devices)
+        actions = QWidget()
+        action_row = QHBoxLayout(actions)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        set_group = QPushButton("设置分组")
+        set_group.clicked.connect(self._set_selected_group)
+        action_row.addWidget(search)
+        action_row.addWidget(set_group)
+        page, layout = self._page_shell("教室", actions)
+        self.seat_map = SeatMapWidget(
+            int(self.config.get("ui.seat_columns", 6)),
+            int(self.config.get("ui.seat_rows", 10)),
+        )
+        self.seat_map.selection_changed.connect(self._selection_changed)
+        self.seat_map.positions_changed.connect(self._save_seat_positions)
+        self.classroom_search = search
+        layout.addWidget(self.seat_map, 1)
+        return page
 
-        for idx, student in enumerate(students):
-            thumb = self._thumb_widgets.get(student.student_id)
-            if not thumb:
-                continue
-            self.wall_layout.removeWidget(thumb)
-            self.wall_layout.addWidget(thumb, idx // cols, idx % cols)
-        self._wall_cols = cols
-        self._update_wall_summary()
+    def _build_inspection_page(self) -> QWidget:
+        actions = QWidget()
+        row = QHBoxLayout(actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        start = QPushButton("开始巡视")
+        start.setProperty("primary", True)
+        start.clicked.connect(self._start_inspection)
+        stop = QPushButton("停止巡视")
+        stop.clicked.connect(self._stop_inspection)
+        row.addWidget(start)
+        row.addWidget(stop)
+        page, layout = self._page_shell("巡视", actions)
+        self.patrol_scroll = QScrollArea()
+        self.patrol_scroll.setWidgetResizable(True)
+        self.patrol_canvas = QWidget()
+        self.patrol_grid = QGridLayout(self.patrol_canvas)
+        self.patrol_grid.setContentsMargins(0, 0, 0, 0)
+        self.patrol_grid.setSpacing(12)
+        self.patrol_scroll.setWidget(self.patrol_canvas)
+        layout.addWidget(self.patrol_scroll, 1)
+        return page
 
-    def _clear_wall_layout(self):
-        for i in reversed(range(self.wall_layout.count())):
-            widget = self.wall_layout.itemAt(i).widget()
-            if widget:
-                self.wall_layout.removeWidget(widget)
-                widget.setParent(None)
+    def _build_files_page(self) -> QWidget:
+        actions = QWidget()
+        row = QHBoxLayout(actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        add_file = QPushButton("添加文件")
+        add_file.clicked.connect(self._add_files)
+        add_folder = QPushButton("添加文件夹")
+        add_folder.clicked.connect(self._add_folder)
+        send = QPushButton("开始分发")
+        send.setProperty("primary", True)
+        send.clicked.connect(self._send_queue)
+        row.addWidget(add_file)
+        row.addWidget(add_folder)
+        row.addWidget(send)
+        page, layout = self._page_shell("文件", actions)
+        self.file_table = self._table(("名称", "类型", "大小", "进度", "状态"))
+        layout.addWidget(self.file_table, 1)
+        self.file_hint = QLabel("接收位置：桌面 / 课堂文件")
+        self.file_hint.setProperty("muted", True)
+        layout.addWidget(self.file_hint)
+        self.file_queue: List[dict] = []
+        return page
 
-    def _update_wall_summary(self):
-        students = self.server.student_manager.get_all_students()
-        online = sum(1 for s in students if s.online)
-        self.wall_summary_label.setText(f"{online} 台在线 / {len(students)} 台总数")
+    def _build_policy_page(self) -> QWidget:
+        device_bar = QWidget()
+        row = QHBoxLayout(device_bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.process_device = QComboBox()
+        self.process_device.setMinimumWidth(180)
+        refresh = QPushButton("刷新进程")
+        refresh.clicked.connect(self._query_processes)
+        terminate = QPushButton("结束进程")
+        terminate.setProperty("danger", True)
+        terminate.clicked.connect(self._terminate_process)
+        add_policy = QPushButton("加入永久黑名单")
+        add_policy.clicked.connect(self._blacklist_selected_process)
+        remove_policy = QPushButton("解除黑名单")
+        remove_policy.clicked.connect(self._remove_blacklist)
+        row.addWidget(self.process_device)
+        row.addWidget(refresh)
+        row.addWidget(terminate)
+        row.addWidget(add_policy)
+        row.addWidget(remove_policy)
+        page, layout = self._page_shell("应用策略", device_bar)
+        self.process_table = self._table(("PID", "进程", "路径", "用户", "保护"))
+        self.process_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        layout.addWidget(self.process_table, 1)
+        self.blacklist_table = self._table(("设备", "程序或路径", "状态"))
+        self.blacklist_table.setMaximumHeight(180)
+        layout.addWidget(self.blacklist_table)
+        return page
 
-    def resizeEvent(self, event):
+    def _build_maintenance_page(self) -> QWidget:
+        page, layout = self._page_shell("设备维护")
+        band = QWidget()
+        row = QHBoxLayout(band)
+        row.setContentsMargins(0, 6, 0, 6)
+        for text, kind in (
+            ("关机", CommandKind.POWER_OFF),
+            ("重启", CommandKind.REBOOT),
+            ("注销", CommandKind.LOGOFF),
+        ):
+            button = QPushButton(text)
+            button.setProperty("danger", True)
+            button.clicked.connect(lambda _checked, value=kind: self._power(value))
+            row.addWidget(button)
+        wake = QPushButton("网络唤醒")
+        wake.clicked.connect(self._wake)
+        row.addWidget(wake)
+        scan = QPushButton("扫描设备")
+        scan.clicked.connect(self.runtime.server.scan_devices)
+        row.addWidget(scan)
+        update = QPushButton("部署签名更新")
+        update.clicked.connect(self._push_update)
+        row.addWidget(update)
+        row.addStretch()
+        layout.addWidget(band)
+        self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态"))
+        layout.addWidget(self.maintenance_table, 1)
+        return page
+
+    def _build_audit_page(self) -> QWidget:
+        export = QPushButton("导出 CSV")
+        export.clicked.connect(self._export_audit)
+        page, layout = self._page_shell("操作记录", export)
+        self.audit_table = self._table(("时间", "操作", "作用域", "成功", "失败", "命令 ID"))
+        layout.addWidget(self.audit_table, 1)
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        save = QPushButton("保存设置")
+        save.setProperty("primary", True)
+        save.clicked.connect(self._save_settings)
+        page, layout = self._page_shell("设置", save)
+        form = QWidget()
+        grid = QGridLayout(form)
+        grid.setContentsMargins(0, 8, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(14)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("浅色", "light")
+        self.theme_combo.addItem("深色", "dark")
+        self.theme_combo.setCurrentIndex(1 if self.config.get("ui.theme") == "dark" else 0)
+        self.theme_combo.currentIndexChanged.connect(
+            lambda: self.apply_theme(str(self.theme_combo.currentData()))
+        )
+        self.seat_columns = QSpinBox()
+        self.seat_columns.setRange(2, 12)
+        self.seat_columns.setValue(int(self.config.get("ui.seat_columns", 6)))
+        self.seat_rows = QSpinBox()
+        self.seat_rows.setRange(1, 20)
+        self.seat_rows.setValue(int(self.config.get("ui.seat_rows", 10)))
+        self.internal_cidrs = QLineEdit(", ".join(self.config.get("teacher.internal_cidrs", [])))
+        self.silence_message = QLineEdit(
+            str(self.config.get("teacher.silence_message", "请保持安静，注意教师屏幕"))
+        )
+        fields = (
+            ("界面主题", self.theme_combo),
+            ("座位列数", self.seat_columns),
+            ("座位行数", self.seat_rows),
+            ("黑屏提示语", self.silence_message),
+            ("保留内网 CIDR", self.internal_cidrs),
+        )
+        for index, (label, widget) in enumerate(fields):
+            grid.addWidget(QLabel(label), index, 0)
+            grid.addWidget(widget, index, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addWidget(form)
+        ports = QLabel("发现 9527  ·  控制 9528  ·  广播 9529  ·  巡视 9530  ·  批量 9531")
+        ports.setProperty("muted", True)
+        layout.addWidget(ports)
+        layout.addStretch()
+        return page
+
+    @staticmethod
+    def _table(headers) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setAlternatingRowColors(False)
+        return table
+
+    @staticmethod
+    def _vertical_divider() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.VLine)
+        line.setFixedWidth(1)
+        return line
+
+    def _connect_runtime(self) -> None:
+        distributor = self.runtime.server.file_distributor
+        distributor.on_progress = lambda transfer_id, sent, total: self.bridge.transfer_progress.emit(
+            transfer_id, sent, total
+        )
+        distributor.on_complete = lambda transfer_id, success, error: self.bridge.transfer_complete.emit(
+            transfer_id, success, error
+        )
+        self.bridge.transfer_progress.connect(self._transfer_progress)
+        self.bridge.transfer_complete.connect(self._transfer_complete)
+
+    def apply_theme(self, theme: str) -> None:
+        self.setStyleSheet(stylesheet(theme))
+
+    def operation_drawer_visibility(self, visible: bool) -> None:
+        self.operation_drawer.setVisible(visible)
+
+    def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if hasattr(self, "wall_scroll"):
-            QTimer.singleShot(0, self._relayout_screen_wall)
+        if (
+            event.size().width() < 1280
+            and hasattr(self, "drawer_button")
+            and self.drawer_button.isChecked()
+        ):
+            self.drawer_button.setChecked(False)
 
-    def eventFilter(self, watched, event):
-        if watched is getattr(self, "wall_widget", None):
-            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                child = self.wall_widget.childAt(event.pos())
-                if child and child is not self.wall_widget:
-                    return False
-                self._wall_drag_origin = event.pos()
-                if self._wall_rubber_band is None:
-                    self._wall_rubber_band = QRubberBand(QRubberBand.Rectangle, self.wall_widget)
-                self._wall_rubber_band.setGeometry(QRect(self._wall_drag_origin, QSize()))
-                self._wall_rubber_band.show()
-                return True
+    def _show_page(self, key: str) -> None:
+        self._active_page = key
+        self.pages.setCurrentIndex(self.page_indexes[key])
+        if key == "inspection":
+            self._refresh_patrol()
 
-            if event.type() == QEvent.MouseMove and self._wall_rubber_band and self._wall_rubber_band.isVisible():
-                rect = QRect(self._wall_drag_origin, event.pos()).normalized()
-                self._wall_rubber_band.setGeometry(rect)
-                return True
+    def _scope_changed(self, *_args) -> None:
+        group_mode = self.scope_buttons["group"].isChecked()
+        self.group_combo.setVisible(group_mode)
+        if self.scope_buttons["all"].isChecked():
+            label = "全班"
+        elif group_mode:
+            label = self.group_combo.currentText() or "分组"
+        else:
+            label = f"已选 {len(self._selected_ids)} 台"
+        self.scope_status.setText(f"作用域：{label}")
 
-            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                if self._wall_rubber_band and self._wall_rubber_band.isVisible():
-                    rect = self._wall_rubber_band.geometry()
-                    self._wall_rubber_band.hide()
-                    selected = set(self._selected_students) if event.modifiers() & Qt.ControlModifier else set()
-                    for sid, thumb in self._thumb_widgets.items():
-                        if rect.intersects(thumb.geometry()):
-                            selected.add(sid)
-                    self._set_selected_students(selected)
-                    return True
+    def _current_scope(self):
+        if self.scope_buttons["all"].isChecked():
+            return TargetScope.all()
+        if self.scope_buttons["group"].isChecked():
+            group = self.group_combo.currentText()
+            if not group:
+                raise ValueError("当前没有可用分组")
+            return TargetScope.group(group)
+        if not self._selected_ids:
+            raise ValueError("请先选择学生设备")
+        return TargetScope.devices(self._selected_ids)
 
-        return super().eventFilter(watched, event)
-
-    def _get_selected_student_ids(self) -> List[str]:
-        return list(self._selected_students)
-
-    def _on_selection_changed(self):
-        if self._syncing_selection:
-            return
-        if self.student_tree.topLevelItemCount() == 0:
-            return
-        self._selected_students = set(self._get_selected_student_ids())
-        selected = set()
-        for item in self.student_tree.selectedItems():
-            sid = item.data(0, Qt.UserRole)
-            if sid:
-                selected.add(sid)
-        self._selected_students = selected
-        self._sync_wall_selection_from_selected()
-
-    def _sync_wall_selection_from_selected(self):
-        for sid, thumb in self._thumb_widgets.items():
-            thumb.set_selected(sid in self._selected_students)
-
-    def _sync_tree_selection_from_selected(self):
-        if not hasattr(self, "student_tree"):
-            return
-        self._syncing_selection = True
+    def _submit(self, callback, success_text: str):
         try:
-            self.student_tree.clearSelection()
-            root_count = self.student_tree.topLevelItemCount()
-            for i in range(root_count):
-                group_item = self.student_tree.topLevelItem(i)
-                for j in range(group_item.childCount()):
-                    item = group_item.child(j)
-                    sid = item.data(0, Qt.UserRole)
-                    if sid in self._selected_students:
-                        item.setSelected(True)
-        finally:
-            self._syncing_selection = False
-
-    def _set_selected_students(self, student_ids, sync_tree: bool = True):
-        self._selected_students = set(student_ids)
-        self._sync_wall_selection_from_selected()
-        if sync_tree:
-            self._sync_tree_selection_from_selected()
-
-    def _on_wall_thumb_clicked(self, student_id: str, event):
-        modifiers = event.modifiers()
-        selected = set(self._selected_students)
-        if modifiers & Qt.ControlModifier:
-            if student_id in selected:
-                selected.remove(student_id)
-            else:
-                selected.add(student_id)
-        elif modifiers & Qt.ShiftModifier:
-            selected.add(student_id)
-        else:
-            selected = {student_id}
-        self._set_selected_students(selected)
-
-    def _on_student_context_menu(self, pos):
-        item = self.student_tree.itemAt(pos)
-        if not item:
-            return
-        sid = item.data(0, Qt.UserRole)
-        if not sid:
-            return
-        if sid not in self._selected_students:
-            self._set_selected_students({sid})
-        self._show_student_control_menu(
-            self.student_tree.viewport().mapToGlobal(pos),
-            list(self._selected_students)
-        )
-        return
-
-    def _on_wall_context_menu(self, global_pos, student_id: str):
-        if student_id not in self._selected_students:
-            self._set_selected_students({student_id})
-        self._show_student_control_menu(global_pos, list(self._selected_students))
-
-    def _show_student_control_menu(self, global_pos, student_ids: List[str]):
-        if not student_ids:
-            return
-        menu = QMenu(self)
-        action_rename = menu.addAction("重命名")
-        action_rename.setEnabled(len(student_ids) == 1)
-        menu.addSeparator()
-        action_black = menu.addAction("黑屏肃静")
-        action_unblack = menu.addAction("解除黑屏")
-        menu.addSeparator()
-        action_broadcast = menu.addAction("开始广播")
-        action_stop = menu.addAction("停止广播")
-
-        action = menu.exec(global_pos)
-        if action == action_rename:
-            self._rename_student(student_ids[0])
-        elif action == action_black:
-            self.server.send_black_screen(student_ids, True)
-        elif action == action_unblack:
-            self.server.send_black_screen(student_ids, False)
-        elif action == action_broadcast:
-            self.server.start_broadcast(student_ids)
-        elif action == action_stop:
-            self.server.stop_broadcast(student_ids)
-
-    def _rename_student(self, student_id: str):
-        student = self.server.student_manager.get_student(student_id)
-        if not student:
-            return
-        new_name, ok = QInputDialog.getText(
-            self, "重命名学生", "请输入新名称:", text=student.display_name
-        )
-        if ok and new_name.strip():
-            self.server.student_manager.set_display_name(student_id, new_name.strip())
-
-    def _on_start_broadcast(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            reply = QMessageBox.question(
-                self, "屏幕广播", "未选择学生，是否对全体在线学生开始广播？"
-            )
-            if reply != QMessageBox.Yes:
-                return
-            self.server.start_broadcast()
-        else:
-            self.server.start_broadcast(sids)
-
-    def _on_stop_broadcast(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            self.server.stop_broadcast()
-        else:
-            self.server.stop_broadcast(sids)
-
-    def _on_black_screen(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            reply = QMessageBox.question(
-                self, "黑屏肃静", "未选择学生，是否对全体在线学生启用黑屏？"
-            )
-            if reply != QMessageBox.Yes:
-                return
-            self.server.send_black_screen_all(True)
-        else:
-            self.server.send_black_screen(sids, True)
-
-    def _on_unblack_screen(self):
-        sids = self._get_selected_student_ids()
-        if not sids:
-            self.server.send_black_screen_all(False)
-        else:
-            self.server.send_black_screen(sids, False)
-
-    def _on_block_net(self):
-        logger.info("Network control is disabled in this build")
-
-    def _on_unblock_net(self):
-        logger.info("Network control is disabled in this build")
-
-    def _choose_file_target_dir(self) -> Optional[Tuple[str, str]]:
-        options = [
-            ("学生端默认目录", "default", ""),
-            ("学生端桌面", "desktop", ""),
-            ("学生端下载目录", "downloads", ""),
-            ("学生端文档目录", "documents", ""),
-            ("C:\\LanClassroom\\Downloads", "c_downloads", ""),
-            ("自定义路径...", "custom", ""),
-        ]
-        labels = [item[0] for item in options]
-        label, ok = QInputDialog.getItem(
-            self,
-            "选择保存位置",
-            "保存到学生端:",
-            labels,
-            1,
-            False
-        )
-        if not ok:
+            receipt = callback(self._current_scope())
+            self.operation_status.setText(f"{success_text} · {len(receipt.target_ids)} 台")
+            self._last_revision = -1
+            return receipt
+        except Exception as exc:
+            QMessageBox.warning(self, "无法执行", str(exc))
             return None
 
-        for option_label, target_type, target_path in options:
-            if option_label == label:
-                if target_type == "custom":
-                    target_path, ok = QInputDialog.getText(
-                        self,
-                        "自定义保存路径",
-                        "请输入学生端绝对路径:",
-                        text="C:\\LanClassroom\\Downloads"
-                    )
-                    if not ok or not target_path.strip():
-                        return None
-                    return target_type, target_path.strip()
-                return target_type, target_path
-        return "default", ""
+    def _start_broadcast(self) -> None:
+        self._submit(self.runtime.start_broadcast, "广播已下发")
 
-    def _on_send_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "所有文件 (*)")
-        if not file_path:
+    def _stop_broadcast(self) -> None:
+        self._submit(self.runtime.stop_broadcast, "广播已停止")
+
+    def _start_silence(self) -> None:
+        message = str(
+            self.config.get("teacher.silence_message", "请保持安静，注意教师屏幕")
+        ).strip()
+        self._submit(
+            lambda scope: self.runtime.set_silence(scope, True, message),
+            "肃静已下发",
+        )
+
+    def _block_network(self) -> None:
+        cidrs = [item.strip() for item in self.config.get("teacher.internal_cidrs", []) if item.strip()]
+        self._submit(lambda scope: self.runtime.set_network_blocked(scope, True, cidrs), "外网限制已下发")
+
+    def _restore_all(self) -> None:
+        self._submit(self.runtime.restore_all, "临时控制已恢复")
+
+    def _start_inspection(self) -> None:
+        session = self._submit(
+            lambda scope: self.runtime.open_inspection(scope, InspectionMode.THUMBNAIL),
+            "巡视已开始",
+        )
+        if session is not None:
+            self._patrol_target_ids.update(session.target_ids)
+
+    def _stop_inspection(self) -> None:
+        receipt = self._submit(self.runtime.close_inspection, "巡视已停止")
+        if receipt is not None:
+            self._patrol_target_ids.difference_update(receipt.target_ids)
+
+    def _poll_runtime(self) -> None:
+        try:
+            snapshot = self.runtime.snapshot(self._last_revision)
+        except Exception as exc:
+            self.operation_status.setText(f"状态读取失败：{exc}")
             return
-        target_dir = self._choose_file_target_dir()
-        if target_dir is None:
+        if snapshot is not None:
+            self._snapshot = snapshot
+            self._last_revision = snapshot.revision
+            self._refresh_devices()
+            self.operation_drawer.set_operations(snapshot.operations)
+            self._refresh_audit(snapshot.operations)
+            self._consume_process_result(snapshot)
+        if self._snapshot:
+            for device in self._snapshot.devices:
+                frame = self.runtime.inspection_media.take(device.device_id)
+                if frame is None:
+                    continue
+                card = self._patrol_cards.get(device.device_id)
+                if card:
+                    card.update_frame(frame.jpeg)
+                viewer = self._viewers.get(device.device_id)
+                if viewer:
+                    viewer.update_frame(frame.jpeg)
+
+    def _refresh_devices(self, *_args) -> None:
+        if not self._snapshot:
             return
-        target_dir_type, target_dir_path = target_dir
-        sids = self._get_selected_student_ids()
-        if not sids:
-            reply = QMessageBox.question(
-                self, "发送文件", "未选择学生，是否发送给全体在线学生？"
-            )
-            if reply != QMessageBox.Yes:
-                return
-            target_count = len(self.server.student_manager.get_online_students())
-            transfer_id = self.server.send_file_all(
-                file_path,
-                target_dir_type=target_dir_type,
-                target_dir_path=target_dir_path
-            )
-            self._register_file_transfer(transfer_id, file_path, target_count)
+        search = self.classroom_search.text().strip().casefold()
+        devices = [
+            item for item in self._snapshot.devices
+            if not search or search in item.hostname.casefold()
+            or search in str(item.metadata.get("ip", "")).casefold()
+        ]
+        signature = tuple(
+            (item.device_id, item.hostname, item.online, item.group, str(item.metadata.get("ip", "")))
+            for item in devices
+        )
+        if signature != self._device_signature:
+            self._device_signature = signature
+            positions = self.config.get("ui.seat_positions", {})
+            self.seat_map.selected = set(self._selected_ids)
+            self.seat_map.set_devices(devices, positions)
+            self._refresh_patrol()
+        online = sum(1 for item in self._snapshot.devices if item.online)
+        self.connection_status.setText(f"{online}/{len(self._snapshot.devices)} 台在线")
+        groups = sorted({item.group for item in self._snapshot.devices if item.group})
+        current = self.group_combo.currentText()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItems(groups)
+        if current in groups:
+            self.group_combo.setCurrentText(current)
+        self.group_combo.blockSignals(False)
+        self._refresh_device_tables()
+
+    def _selection_changed(self, device_ids: tuple) -> None:
+        self._selected_ids = set(device_ids)
+        self._scope_changed()
+
+    def _save_seat_positions(self, positions: dict) -> None:
+        self.config.set("ui.seat_positions", positions)
+        self.config.save()
+
+    def _set_selected_group(self) -> None:
+        if not self._selected_ids:
+            QMessageBox.warning(self, "无法分组", "请先选择学生设备")
+            return
+        group, accepted = QInputDialog.getText(self, "设置分组", "分组名称：")
+        group = group.strip()
+        if not accepted or not group:
+            return
+        try:
+            changed = self.runtime.set_group(sorted(self._selected_ids), group)
+            self.operation_status.setText(f"已将 {changed} 台设备移入 {group}")
+            self._last_revision = -1
+        except Exception as exc:
+            QMessageBox.warning(self, "分组失败", str(exc))
+
+    def _refresh_patrol(self) -> None:
+        while self.patrol_grid.count():
+            item = self.patrol_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._patrol_cards.clear()
+        if not self._snapshot:
+            return
+        for index, device in enumerate(self._snapshot.devices):
+            card = PatrolCard(device)
+            card.opened.connect(self._open_viewer)
+            self._patrol_cards[device.device_id] = card
+            self.patrol_grid.addWidget(card, index // 4, index % 4)
+        self.patrol_grid.setRowStretch((len(self._snapshot.devices) + 3) // 4, 1)
+
+    def _open_viewer(self, device_id: str) -> None:
+        if not self._snapshot:
+            return
+        device = self._snapshot.device(device_id)
+        if not device:
+            return
+        try:
+            self.runtime.open_inspection(DeviceIds([device_id]), InspectionMode.FOCUS)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法查看", str(exc))
+            return
+        viewer = FullScreenViewer(device_id, device.hostname, self)
+        viewer.remote_input.connect(self.runtime.send_remote_input)
+        viewer.remote_toggled.connect(self._remote_toggled)
+        viewer.finished.connect(lambda _result, value=device_id: self._viewer_closed(value))
+        self._viewers[device_id] = viewer
+        viewer.showFullScreen()
+
+    def _remote_toggled(self, device_id: str, enabled: bool) -> None:
+        try:
+            if enabled:
+                self.runtime.start_remote_control(device_id)
+            else:
+                self.runtime.stop_remote_control(device_id)
+                self.runtime.open_inspection(
+                    DeviceIds([device_id]), InspectionMode.FOCUS
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "远程控制失败", str(exc))
+
+    def _viewer_closed(self, device_id: str) -> None:
+        viewer = self._viewers.pop(device_id, None)
+        try:
+            if viewer and viewer.remote_enabled:
+                self.runtime.stop_remote_control(device_id)
+            if device_id in self._patrol_target_ids:
+                self.runtime.open_inspection(
+                    DeviceIds([device_id]), InspectionMode.THUMBNAIL
+                )
+            else:
+                self.runtime.close_inspection(DeviceIds([device_id]))
+        except Exception:
+            pass
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "添加文件")
+        for path in paths:
+            self._queue_path(path)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "添加文件夹")
+        if path:
+            self._queue_path(path)
+
+    def _queue_path(self, path: str) -> None:
+        if any(item["path"] == path for item in self.file_queue):
+            return
+        is_dir = os.path.isdir(path)
+        size = 0
+        if is_dir:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    try:
+                        size += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
         else:
-            target_count = len(sids)
-            transfer_id = self.server.send_file(
-                file_path,
-                sids,
-                target_dir_type=target_dir_type,
-                target_dir_path=target_dir_path
-            )
-            self._register_file_transfer(transfer_id, file_path, target_count)
-        QMessageBox.information(self, "发送文件", "文件已开始发送")
+            size = os.path.getsize(path)
+        self.file_queue.append({"path": path, "size": size, "type": "文件夹" if is_dir else "文件", "status": "等待"})
+        row = self.file_table.rowCount()
+        self.file_table.insertRow(row)
+        values = (os.path.basename(path), "文件夹" if is_dir else "文件", self._format_size(size), "0%", "等待")
+        for column, value in enumerate(values):
+            self.file_table.setItem(row, column, QTableWidgetItem(value))
 
-    def _on_push_update(self):
-        # 1. 选择更新包 zip
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择更新包", "", "更新包 (*.zip);;所有文件 (*)"
-        )
-        if not file_path:
+    def _send_queue(self) -> None:
+        try:
+            scope = self._current_scope()
+            target_ids = self._resolve_scope_ids(scope)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法分发", str(exc))
             return
-        # 2. 输入版本号
-        version, ok = QInputDialog.getText(
-            self, "推送更新", "请输入新版本号:", text="1.0.8"
-        )
-        if not ok or not version.strip():
+        for index, item in enumerate(self.file_queue):
+            if item["status"] not in {"等待", "失败"}:
+                continue
+            transfer_id = self.runtime.server.send_file(item["path"], target_ids)
+            item["status"] = "发送中"
+            item["transfer_id"] = transfer_id
+            self._file_rows[transfer_id] = index
+            self.file_table.item(index, 4).setText("发送中")
+
+    def _transfer_progress(self, transfer_id: str, sent: int, total: int) -> None:
+        row = self._file_rows.get(transfer_id)
+        if row is None:
             return
-        version = version.strip()
-        # 3. 确认推送范围
-        sids = self._get_selected_student_ids()
-        if not sids:
-            reply = QMessageBox.question(
-                self, "推送更新",
-                f"未选择学生，是否推送给全体在线学生？\n版本: {version}\n文件: {file_path}"
-            )
-            if reply != QMessageBox.Yes:
+        percent = int(sent * 100 / total) if total else 100
+        self.file_table.item(row, 3).setText(f"{percent}%")
+
+    def _transfer_complete(self, transfer_id: str, success: bool, error: str) -> None:
+        row = self._file_rows.get(transfer_id)
+        if row is None:
+            return
+        self.file_queue[row]["status"] = "完成" if success else "失败"
+        self.file_table.item(row, 4).setText("完成" if success else f"失败：{error}")
+
+    def _query_processes(self) -> None:
+        device_id = self.process_device.currentData()
+        if not device_id:
+            return
+        try:
+            receipt = self.runtime.query_processes(str(device_id))
+            self._process_command_id = receipt.command_id
+            self.operation_status.setText("正在读取进程列表")
+        except Exception as exc:
+            QMessageBox.warning(self, "读取失败", str(exc))
+
+    def _consume_process_result(self, snapshot) -> None:
+        if not self._process_command_id:
+            return
+        operation = snapshot.operation(self._process_command_id)
+        if not operation or not operation.statuses:
+            return
+        status = operation.statuses[0]
+        if status.state.value == "applied":
+            processes = status.payload.get("processes", [])
+            self.process_table.setRowCount(0)
+            for process in processes:
+                row = self.process_table.rowCount()
+                self.process_table.insertRow(row)
+                values = (
+                    process.get("pid", ""), process.get("name", ""),
+                    process.get("path", ""), process.get("username", ""),
+                    process.get("protection_reason", "") if process.get("protected") else "",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value or ""))
+                    item.setData(Qt.UserRole, process)
+                    self.process_table.setItem(row, column, item)
+            self._process_command_id = None
+            self.operation_status.setText(f"已读取 {len(processes)} 个进程")
+        elif status.state.value in {"failed", "timed_out"}:
+            self._process_command_id = None
+            self.operation_status.setText(f"进程读取失败：{status.detail}")
+
+    def _selected_process(self):
+        row = self.process_table.currentRow()
+        if row < 0:
+            raise ValueError("请先选择一个进程")
+        return self.process_table.item(row, 0).data(Qt.UserRole)
+
+    def _terminate_process(self) -> None:
+        try:
+            process = self._selected_process()
+            device_id = str(self.process_device.currentData())
+            if process.get("protected"):
+                raise ValueError("该进程受保护，不能结束")
+            if QMessageBox.question(self, "结束进程", f"确定结束 {process.get('name')}（PID {process.get('pid')}）？") != QMessageBox.Yes:
                 return
-            count = self.server.push_update(file_path, version)
-        else:
-            reply = QMessageBox.question(
-                self, "推送更新",
-                f"确认向选中的 {len(sids)} 名学生推送更新？\n版本: {version}\n文件: {file_path}"
+            self.runtime.terminate_process(
+                DeviceIds([device_id]), int(process["pid"]),
+                float(process["creation_time"]), str(process.get("name") or ""),
             )
-            if reply != QMessageBox.Yes:
+        except Exception as exc:
+            QMessageBox.warning(self, "无法结束进程", str(exc))
+
+    def _blacklist_selected_process(self) -> None:
+        try:
+            process = self._selected_process()
+            device_id = str(self.process_device.currentData())
+            if QMessageBox.question(self, "永久应用策略", f"永久禁止运行 {process.get('name')}？\n只有教师端可以解除。") != QMessageBox.Yes:
                 return
-            count = self.server.push_update(file_path, version, sids)
-        QMessageBox.information(
-            self, "推送更新",
-            f"已通知 {count} 名学生有新版本 {version}\n"
-            f"学生端会自动下载并安装重启。"
-        )
+            self.runtime.set_blacklist(
+                DeviceIds([device_id]), str(process.get("name") or ""),
+                str(process.get("path") or ""), True,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "无法添加策略", str(exc))
 
-    def _update_status_bar(self):
-        online = self.server.student_manager.online_count()
-        total = self.server.student_manager.count()
-        discovered = len(self._discovered_cache)
-        self.status_label.setText(f"在线学生: {online} / 总数: {total} | 发现设备: {discovered}")
-
-    def _on_scan_devices(self):
-        self.left_tabs.setCurrentIndex(1)
-        self.discover_status.setText("正在扫描局域网...")
-        self.server.scan_devices()
-        QTimer.singleShot(3000, self._update_discover_status_text)
-
-    def _on_refresh_connections(self):
-        self.status_label.setText("正在检测学生端连接...")
-
-        def worker():
-            try:
-                result = self.server.refresh_connections()
-            except Exception as e:
-                logger.warning(f"Refresh connections failed: {e}")
-                result = {"error": str(e), "checked": 0, "alive": 0, "offline": 0}
-            self.connection_refresh_complete.emit(result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_connection_refresh_complete(self, result: dict):
-        self._refresh_student_list()
-        self._refresh_screen_wall_status()
-        self._update_status_bar()
-        if result.get("error"):
-            self.status_label.setText(f"连接检测失败: {result['error']}")
+    def _remove_blacklist(self) -> None:
+        row = self.blacklist_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "无法解除", "请先选择一条黑名单策略")
             return
-        self.status_label.setText(
-            f"连接检测完成: 已检查 {result.get('checked', 0)} 台，"
-            f"在线响应 {result.get('alive', 0)} 台，标记离线 {result.get('offline', 0)} 台"
-        )
-        QTimer.singleShot(3500, self._update_status_bar)
+        value = self.blacklist_table.item(row, 0).data(Qt.UserRole)
+        try:
+            self.runtime.set_blacklist(
+                DeviceIds([value["device_id"]]), value["program"], value["path"], False
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "无法解除", str(exc))
 
-    def _update_discover_status_text(self):
-        count = len(self._discovered_cache)
-        self.discover_status.setText(f"已发现 {count} 台设备")
-
-    def _on_discovered_student(self, info: dict):
-        sid = info.get("student_id", "")
-        if not sid:
+    def _power(self, kind: CommandKind) -> None:
+        names = {CommandKind.POWER_OFF: "关机", CommandKind.REBOOT: "重启", CommandKind.LOGOFF: "注销"}
+        try:
+            scope = self._current_scope()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法执行", str(exc))
             return
-        if self.server.student_manager.get_student(sid):
+        if QMessageBox.question(self, names[kind], f"确定对当前作用域执行{name[kind]}？") != QMessageBox.Yes:
             return
-        self._discovered_cache[sid] = info
-        self._refresh_discover_list()
-        self._update_status_bar()
+        self.runtime.power(scope, kind)
 
-    def _on_discovered_lost(self, info: dict):
-        sid = info.get("student_id", "")
-        if sid in self._discovered_cache:
-            del self._discovered_cache[sid]
-            self._refresh_discover_list()
-            self._update_status_bar()
+    def _wake(self) -> None:
+        try:
+            results = self.runtime.wake(self._current_scope())
+            sent = sum(bool(result and result.success) for result in results.values())
+            self.operation_status.setText(f"网络唤醒已发送 · {sent}/{len(results)} 台")
+        except Exception as exc:
+            QMessageBox.warning(self, "网络唤醒失败", str(exc))
 
-    def _refresh_discover_list(self):
-        self.discover_list.clear()
-        for info in self._discovered_cache.values():
-            hostname = info.get("hostname", "unknown")
-            ip = info.get("ip", "")
-            mac = info.get("mac", "")
-            item = QListWidgetItem(f"{hostname}  ({ip})")
-            item.setData(Qt.UserRole, info)
-            item.setToolTip(f"主机名: {hostname}\nIP: {ip}\nMAC: {mac}")
-            self.discover_list.addItem(item)
-        count = len(self._discovered_cache)
-        self.discover_status.setText(f"已发现 {count} 台设备")
-
-    def _on_discover_selection_changed(self):
-        items = self.discover_list.selectedItems()
-        self.btn_add_selected.setEnabled(len(items) > 0)
-
-    def _on_discover_double_click(self, item):
-        info = item.data(Qt.UserRole)
-        if info:
-            self._add_discovered_device(info)
-
-    def _on_add_selected_devices(self):
-        items = self.discover_list.selectedItems()
-        if not items:
+    def _push_update(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择签名更新包", filter="ZIP (*.zip)")
+        if not path:
             return
-        added = 0
-        for item in items:
-            info = item.data(Qt.UserRole)
-            if info:
-                self._add_discovered_device(info)
-                added += 1
-        if added > 0:
-            QMessageBox.information(self, "添加设备", f"已添加 {added} 台设备")
+        try:
+            with open(path + ".manifest.json", "r", encoding="utf-8") as handle:
+                version = str(json.load(handle)["version"])
+            target_ids = self._resolve_scope_ids(self._current_scope())
+            count = self.runtime.server.push_update(path, version, target_ids)
+            if count <= 0:
+                raise ValueError("更新包签名无效，或当前作用域没有在线设备")
+            self.operation_status.setText(f"更新通知已发送 · {count} 台")
+        except Exception as exc:
+            QMessageBox.warning(self, "无法部署更新", str(exc))
 
-    def _add_discovered_device(self, info: dict):
-        ip = info.get("ip", "")
-        if not ip:
+    def _refresh_device_tables(self) -> None:
+        devices = tuple(self._snapshot.devices) if self._snapshot else ()
+        current = self.process_device.currentData()
+        self.process_device.blockSignals(True)
+        self.process_device.clear()
+        for device in devices:
+            if device.online:
+                self.process_device.addItem(device.hostname, device.device_id)
+        index = self.process_device.findData(current)
+        if index >= 0:
+            self.process_device.setCurrentIndex(index)
+        self.process_device.blockSignals(False)
+        self.maintenance_table.setRowCount(0)
+        self.blacklist_table.setRowCount(0)
+        for device in devices:
+            row = self.maintenance_table.rowCount()
+            self.maintenance_table.insertRow(row)
+            meta = device.metadata
+            values = (
+                device.hostname, meta.get("ip", ""), meta.get("mac", ""),
+                meta.get("os", "Windows"), meta.get("version", ""),
+                "在线" if device.online else "离线",
+            )
+            for column, value in enumerate(values):
+                self.maintenance_table.setItem(row, column, QTableWidgetItem(str(value)))
+            for state in device.expected:
+                if not state.domain.startswith("blacklist:") or not state.value:
+                    continue
+                identity = state.domain.split(":", 1)[1]
+                policy_row = self.blacklist_table.rowCount()
+                self.blacklist_table.insertRow(policy_row)
+                is_path = "\\" in identity or "/" in identity
+                data = {
+                    "device_id": device.device_id,
+                    "program": ntpath.basename(identity) if is_path else identity,
+                    "path": identity if is_path else "",
+                }
+                first = QTableWidgetItem(device.hostname)
+                first.setData(Qt.UserRole, data)
+                self.blacklist_table.setItem(policy_row, 0, first)
+                self.blacklist_table.setItem(policy_row, 1, QTableWidgetItem(identity))
+                self.blacklist_table.setItem(policy_row, 2, QTableWidgetItem("永久生效"))
+
+    def _refresh_audit(self, operations) -> None:
+        self.audit_table.setRowCount(0)
+        for operation in reversed(tuple(operations)):
+            row = self.audit_table.rowCount()
+            self.audit_table.insertRow(row)
+            success = sum(status.state.value == "applied" for status in operation.statuses)
+            failed = sum(status.state.value in {"failed", "timed_out"} for status in operation.statuses)
+            values = (
+                datetime.fromtimestamp(operation.submitted_at).strftime("%Y-%m-%d %H:%M:%S"),
+                operation.action.kind.value, str(len(operation.target_ids)),
+                str(success), str(failed), operation.command_id,
+            )
+            for column, value in enumerate(values):
+                self.audit_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _export_audit(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "导出操作记录", "课堂操作记录.csv", "CSV (*.csv)")
+        if not path:
             return
-        logger.info(f"Adding discovered device: {info.get('hostname')} ({ip})")
-        self.server.add_discovered_student(info)
-        self.discover_status.setText(f"已请求 {info.get('hostname')} 连接，请稍候...")
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([self.audit_table.horizontalHeaderItem(i).text() for i in range(self.audit_table.columnCount())])
+            for row in range(self.audit_table.rowCount()):
+                writer.writerow([self.audit_table.item(row, column).text() for column in range(self.audit_table.columnCount())])
+        self.operation_status.setText(f"已导出：{path}")
 
-    def closeEvent(self, event):
-        reply = QMessageBox.question(
-            self, "确认退出", "确定要退出教师端吗？"
-        )
-        if reply == QMessageBox.Yes:
-            self.server.stop()
-            event.accept()
-        else:
-            event.ignore()
+    def _save_settings(self) -> None:
+        theme = str(self.theme_combo.currentData())
+        cidrs = [item.strip() for item in self.internal_cidrs.text().split(",") if item.strip()]
+        self.config.set("ui.theme", theme)
+        self.config.set("ui.seat_columns", self.seat_columns.value())
+        self.config.set("ui.seat_rows", self.seat_rows.value())
+        self.config.set("teacher.silence_message", self.silence_message.text().strip())
+        self.config.set("teacher.internal_cidrs", cidrs)
+        self.config.save()
+        self.seat_map.rows = self.seat_rows.value()
+        self.seat_map.set_columns(self.seat_columns.value())
+        self.apply_theme(theme)
+        self.operation_status.setText("设置已保存")
+
+    def _resolve_scope_ids(self, scope) -> List[str]:
+        if not self._snapshot:
+            return []
+        if isinstance(scope, DeviceIds):
+            return list(scope.device_ids)
+        if hasattr(scope, "name"):
+            return [item.device_id for item in self._snapshot.devices if item.group == scope.name]
+        return [item.device_id for item in self._snapshot.devices]
+
+    @staticmethod
+    def _format_size(value: int) -> str:
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} GB"
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.poll_timer.stop()
+        for viewer in tuple(self._viewers.values()):
+            viewer.close()
+        try:
+            self.runtime.close()
+        except Exception as exc:
+            logger.warning(f"Teacher runtime close failed: {exc}")
+        event.accept()
+
+
+__all__ = ["TeacherMainWindow"]

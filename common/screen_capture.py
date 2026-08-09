@@ -2,7 +2,7 @@ import io
 import threading
 import time
 from typing import Optional, Tuple
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from common.logger import get_logger
 
 logger = get_logger("screen_capture")
@@ -67,7 +67,7 @@ class ScreenCapturer:
                 monitor_info = monitors[self.monitor]
                 self._frame_size = (monitor_info["width"], monitor_info["height"])
                 while self._running:
-                    start_time = time.time()
+                    start_time = time.monotonic()
                     try:
                         raw = sct.grab(monitor_info)
                         if not raw or not raw.rgb:
@@ -82,7 +82,7 @@ class ScreenCapturer:
                             self._on_frame(jpeg_data, img.size)
                     except Exception as e:
                         logger.debug(f"Capture error: {e}")
-                    elapsed = time.time() - start_time
+                    elapsed = time.monotonic() - start_time
                     sleep_time = self._frame_interval - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
@@ -91,7 +91,7 @@ class ScreenCapturer:
 
     def _compress_frame(self, img: Image.Image) -> bytes:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=self.quality, optimize=True)
+        img.save(buf, format="JPEG", quality=self.quality, optimize=False)
         return buf.getvalue()
 
     def _resize_frame(self, img: Image.Image) -> Image.Image:
@@ -132,11 +132,7 @@ class FrameDiffCalculator:
         w, h = img1.size
         blocks_w = (w + self.block_size - 1) // self.block_size
         blocks_h = (h + self.block_size - 1) // self.block_size
-        import numpy as np
-        arr1 = np.array(img1, dtype=np.int16)
-        arr2 = np.array(img2, dtype=np.int16)
-        diff = np.abs(arr1 - arr2)
-        diff_mean = diff.mean(axis=2)
+        diff = ImageChops.difference(img1.convert("RGB"), img2.convert("RGB"))
         changed_blocks = []
         for by in range(blocks_h):
             for bx in range(blocks_w):
@@ -144,8 +140,9 @@ class FrameDiffCalculator:
                 y0 = by * self.block_size
                 x1 = min(x0 + self.block_size, w)
                 y1 = min(y0 + self.block_size, h)
-                block_diff = diff_mean[y0:y1, x0:x1]
-                if block_diff.mean() > self.threshold:
+                block_diff = diff.crop((x0, y0, x1, y1))
+                channel_means = ImageStat.Stat(block_diff).mean
+                if sum(channel_means) / max(1, len(channel_means)) > self.threshold:
                     changed_blocks.append((bx, by))
         return changed_blocks
 

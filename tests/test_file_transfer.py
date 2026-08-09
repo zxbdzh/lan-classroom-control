@@ -7,6 +7,7 @@ from common.file_transfer import (
     FileTransferSender,
     FileTransferReceiver,
     CHUNK_SIZE,
+    FILE_HEADER_FORMAT,
     TARGET_DIR_CUSTOM,
 )
 
@@ -55,6 +56,45 @@ class TestFileTransferSender:
 
 
 class TestFileTransferReceiver:
+    def test_resume_uses_hash_named_partial_file(self, temp_dir):
+        content = os.urandom(CHUNK_SIZE * 2 + 123)
+        source = os.path.join(temp_dir, "resume.bin")
+        with open(source, "wb") as handle:
+            handle.write(content)
+        sha256 = hashlib.sha256(content).hexdigest()
+        params = {
+            "transfer_id": "first-attempt",
+            "file_name": "resume.bin",
+            "file_size": len(content),
+            "total_chunks": 3,
+            "sha256": sha256,
+        }
+        save_dir = os.path.join(temp_dir, "received")
+        first = FileTransferReceiver(save_dir)
+        assert first.handle_start(params)["resume_chunk"] == 0
+        import struct
+        first.handle_data({
+            "transfer_id": "first-attempt",
+            "chunk_index": 0,
+            "data": struct.pack(FILE_HEADER_FORMAT, 1, 0, CHUNK_SIZE) + content[:CHUNK_SIZE],
+        })
+        first._active_transfers["first-attempt"]["file"].close()
+
+        second = FileTransferReceiver(save_dir)
+        params["transfer_id"] = "second-attempt"
+        assert second.handle_start(params)["resume_chunk"] == 1
+        for chunk_index in (1, 2):
+            chunk = content[chunk_index * CHUNK_SIZE:(chunk_index + 1) * CHUNK_SIZE]
+            second.handle_data({
+                "transfer_id": "second-attempt",
+                "chunk_index": chunk_index,
+                "data": struct.pack(FILE_HEADER_FORMAT, 1, chunk_index, len(chunk)) + chunk,
+            })
+        success, result = second.handle_end({"transfer_id": "second-attempt"})
+        assert success is True
+        with open(result, "rb") as handle:
+            assert handle.read() == content
+
     def test_full_transfer_small_file(self, temp_dir, test_file):
         file_path, content = test_file
         sender = FileTransferSender()
@@ -298,3 +338,93 @@ class TestFileDistributor:
         params = start_messages[0]["params"]
         assert params["target_dir_type"] == TARGET_DIR_CUSTOM
         assert params["target_dir_path"] == target_dir
+
+    def test_folder_distribution_preserves_the_source_root(self, temp_dir):
+        from teacher.core.file_distributor import FileDistributor
+
+        source = os.path.join(temp_dir, "课程资料")
+        nested = os.path.join(source, "第一章")
+        os.makedirs(nested)
+        with open(os.path.join(nested, "讲义.txt"), "wb") as handle:
+            handle.write(b"lesson")
+        sent_messages = []
+
+        class FakeConn:
+            def is_alive(self):
+                return True
+
+            def send_message(self, message):
+                sent_messages.append(message)
+                return True
+
+        class FakeStudent:
+            conn = FakeConn()
+
+        distributor = FileDistributor(ack_timeout=0.05)
+        transfer_id = distributor.send_file_to_students(source, [FakeStudent()])
+        deadline = time.time() + 3
+        while distributor.get_transfer_info(transfer_id) and time.time() < deadline:
+            time.sleep(0.01)
+
+        receiver = FileTransferReceiver(os.path.join(temp_dir, "received"))
+        result = None
+        for message in sent_messages:
+            params = message["params"]
+            if message["type"] == "file_send_start":
+                receiver.handle_start(params)
+            elif message["type"] == "file_send_data":
+                assert receiver.handle_data(params)
+            elif message["type"] == "file_send_end":
+                success, result = receiver.handle_end(params)
+                assert success
+
+        assert os.path.basename(result) == "课程资料"
+        assert os.path.isfile(os.path.join(result, "第一章", "讲义.txt"))
+
+    def test_completion_waits_for_student_integrity_ack(self, test_file):
+        from teacher.core.file_distributor import FileDistributor
+
+        file_path, _ = test_file
+        sent_messages = []
+        completed = []
+
+        class FakeConn:
+            def is_alive(self):
+                return True
+
+            def send_message(self, message):
+                sent_messages.append(message)
+                return True
+
+        class FakeStudent:
+            student_id = "pc-01"
+            conn = FakeConn()
+
+        distributor = FileDistributor(ack_timeout=0.5)
+        distributor.on_complete = lambda *args: completed.append(args)
+        transfer_id = distributor.send_file_to_students(file_path, [FakeStudent()])
+        deadline = time.time() + 2
+        while not any(item["type"] == "file_send_start" for item in sent_messages):
+            assert time.time() < deadline
+            time.sleep(0.01)
+        distributor.record_ack({
+            "transfer_id": transfer_id,
+            "student_id": "pc-01",
+            "stage": "start",
+            "resume_chunk": 0,
+        })
+        while not any(item["type"] == "file_send_end" for item in sent_messages):
+            assert time.time() < deadline
+            time.sleep(0.01)
+        assert completed == []
+        distributor.record_ack({
+            "transfer_id": transfer_id,
+            "student_id": "pc-01",
+            "stage": "end",
+            "success": True,
+            "result": "ok",
+        })
+        while not completed:
+            assert time.time() < deadline
+            time.sleep(0.01)
+        assert completed == [(transfer_id, True, "")]

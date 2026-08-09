@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 import base64
+import zipfile
 from typing import Callable, Dict, Optional, Tuple
 from common.logger import get_logger
 
@@ -50,12 +51,23 @@ class FileTransferSender:
                 md5.update(chunk)
         return md5.hexdigest()
 
+    def compute_sha256(self, file_path: str) -> str:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def start_transfer(self, transfer_id: str, file_path: str,
                        send_func: Callable, progress_callback: Optional[Callable] = None):
         file_size = os.path.getsize(file_path)
         total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         file_name = os.path.basename(file_path)
         md5 = self.compute_md5(file_path)
+        sha256 = self.compute_sha256(file_path)
 
         start_msg = {
             "transfer_id": transfer_id,
@@ -63,6 +75,7 @@ class FileTransferSender:
             "file_size": file_size,
             "total_chunks": total_chunks,
             "md5": md5,
+            "sha256": sha256,
         }
         send_func("start", start_msg)
 
@@ -85,6 +98,7 @@ class FileTransferSender:
             "transfer_id": transfer_id,
             "total_chunks": total_chunks,
             "md5": md5,
+            "sha256": sha256,
         }
         send_func("end", end_msg)
         logger.info(f"File transfer complete: {file_name}, size: {file_size}")
@@ -97,39 +111,56 @@ class FileTransferReceiver:
         self._lock = threading.Lock()
         os.makedirs(save_dir, exist_ok=True)
 
-    def handle_start(self, params: dict):
+    def handle_start(self, params: dict) -> dict:
         transfer_id = params["transfer_id"]
         file_name = os.path.basename(params["file_name"]) or transfer_id
         file_size = params["file_size"]
         total_chunks = params["total_chunks"]
         md5 = params.get("md5", "")
+        sha256 = params.get("sha256", "")
         target_dir = self._resolve_target_dir(
             params.get("target_dir_type", TARGET_DIR_DEFAULT),
             params.get("target_dir_path", "")
         )
 
-        save_path = os.path.join(target_dir, file_name)
+        final_path = os.path.join(target_dir, file_name)
         # 文件名冲突自动加序号 (1), (2)...
-        if os.path.exists(save_path):
+        if os.path.exists(final_path):
             base, ext = os.path.splitext(file_name)
             i = 1
             while os.path.exists(os.path.join(target_dir, f"{base}({i}){ext}")):
                 i += 1
-            save_path = os.path.join(target_dir, f"{base}({i}){ext}")
-            logger.info(f"File name conflict, renamed to: {os.path.basename(save_path)}")
+            final_path = os.path.join(target_dir, f"{base}({i}){ext}")
+            logger.info(f"File name conflict, renamed to: {os.path.basename(final_path)}")
+        content_key = (sha256 or md5 or transfer_id).replace("/", "_").replace("\\", "_")
+        save_path = os.path.join(target_dir, f".{file_name}.{content_key}.part")
+        resume_chunk = 0
+        if os.path.isfile(save_path):
+            partial_size = min(os.path.getsize(save_path), int(file_size))
+            resume_chunk = partial_size // CHUNK_SIZE
+        mode = "r+b" if os.path.exists(save_path) else "w+b"
         with self._lock:
+            previous = self._active_transfers.pop(transfer_id, None)
+            if previous:
+                previous["file"].close()
             self._active_transfers[transfer_id] = {
                 "file_name": file_name,
                 "save_path": save_path,
+                "final_path": final_path,
                 "target_dir": target_dir,
                 "file_size": file_size,
                 "total_chunks": total_chunks,
-                "received_chunks": 0,
+                "received_chunks": resume_chunk,
+                "received_indices": set(range(resume_chunk)),
                 "md5": md5,
+                "sha256": sha256,
+                "is_archive": bool(params.get("is_archive", False)),
+                "archive_root": os.path.basename(str(params.get("archive_root", ""))),
                 "start_time": time.time(),
-                "file": open(save_path, "wb"),
+                "file": open(save_path, mode),
             }
         logger.info(f"Receiving file: {file_name}, size: {file_size}, save to: {save_path}")
+        return {"transfer_id": transfer_id, "resume_chunk": resume_chunk}
 
     def _resolve_target_dir(self, target_dir_type: str, target_dir_path: str = "") -> str:
         home_dir = os.path.expanduser("~")
@@ -183,12 +214,20 @@ class FileTransferReceiver:
             return False
 
         _, idx, chunk_len = struct.unpack(FILE_HEADER_FORMAT, data[:FILE_HEADER_SIZE])
+        if idx != chunk_index or chunk_len < 0 or chunk_len > CHUNK_SIZE:
+            return False
         chunk_data = data[FILE_HEADER_SIZE:FILE_HEADER_SIZE + chunk_len]
+        if len(chunk_data) != chunk_len:
+            return False
 
+        if chunk_index in transfer["received_indices"]:
+            return True
         file_obj = transfer["file"]
         offset = chunk_index * CHUNK_SIZE
         file_obj.seek(offset)
         file_obj.write(chunk_data)
+        file_obj.flush()
+        transfer["received_indices"].add(chunk_index)
         transfer["received_chunks"] += 1
         return True
 
@@ -201,30 +240,75 @@ class FileTransferReceiver:
 
             file_obj = transfer["file"]
             save_path = transfer["save_path"]
+            final_path = transfer["final_path"]
             expected_md5 = transfer.get("md5", "")
+            expected_sha256 = transfer.get("sha256", "")
             file_obj.close()
 
             del self._active_transfers[transfer_id]
 
-        if expected_md5:
+        if transfer["received_chunks"] < transfer["total_chunks"]:
+            return False, "Transfer is incomplete"
+        with open(save_path, "r+b") as handle:
+            handle.truncate(int(transfer["file_size"]))
+
+        if expected_sha256:
+            actual_sha256 = self._compute_file_hash(save_path, "sha256")
+            if actual_sha256 != expected_sha256:
+                logger.error(
+                    f"SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+                )
+                return False, "SHA-256 mismatch"
+        elif expected_md5:
             actual_md5 = self._compute_file_md5(save_path)
             if actual_md5 != expected_md5:
                 logger.error(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
                 return False, "MD5 mismatch"
 
+        os.replace(save_path, final_path)
+        result_path = final_path
+        if transfer.get("is_archive"):
+            try:
+                result_path = self._extract_archive_safely(
+                    final_path, transfer["target_dir"], transfer.get("archive_root", "")
+                )
+                os.remove(final_path)
+            except Exception as exc:
+                logger.error(f"Archive extraction failed: {exc}")
+                return False, f"Archive extraction failed: {exc}"
+
         elapsed = time.time() - transfer["start_time"]
         logger.info(f"File received: {transfer['file_name']}, time: {elapsed:.2f}s")
-        return True, save_path
+        return True, result_path
 
     def _compute_file_md5(self, file_path: str) -> str:
-        md5 = hashlib.md5()
+        return self._compute_file_hash(file_path, "md5")
+
+    def _compute_file_hash(self, file_path: str, algorithm: str) -> str:
+        digest = hashlib.new(algorithm)
         with open(file_path, "rb") as f:
             while True:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                md5.update(chunk)
-        return md5.hexdigest()
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _extract_archive_safely(
+        archive_path: str, target_dir: str, archive_root: str = ""
+    ) -> str:
+        destination = os.path.abspath(target_dir)
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            for member in archive.infolist():
+                member_path = os.path.abspath(os.path.join(destination, member.filename))
+                if os.path.commonpath([destination, member_path]) != destination:
+                    raise ValueError("archive contains an unsafe path")
+                if member.filename.startswith(("/", "\\")):
+                    raise ValueError("archive contains an absolute path")
+            archive.extractall(destination)
+        root = os.path.basename(archive_root) if archive_root else ""
+        return os.path.join(destination, root) if root else destination
 
     def get_progress(self, transfer_id: str) -> float:
         with self._lock:

@@ -1,6 +1,8 @@
 """自动更新功能测试"""
 import os
 import sys
+import base64
+import struct
 import tempfile
 import shutil
 import zipfile
@@ -104,7 +106,7 @@ class TestUpdateClient:
             "transfer_id": "t1",
             "file_name": "update.zip",
             "file_size": 100,
-            "total_chunks": 2,
+            "total_chunks": 1,
             "md5": "",
             "target_version": "1.0.8",
         })
@@ -124,12 +126,116 @@ class TestUpdateClient:
             "transfer_id": "t1",
             "file_name": "update.zip",
             "file_size": 100,
-            "total_chunks": 2,
+            "total_chunks": 1,
             "md5": "",
             "target_version": "1.0.8",
         })
         client.cancel()
         assert client._active_transfer is None
+
+    def test_update_chunks_reject_mismatched_header_and_ignore_duplicates(self):
+        from common.file_transfer import FILE_HEADER_FORMAT
+
+        client = self._create_client()
+        client.handle_start({
+            "transfer_id": "t1",
+            "file_name": "update.zip",
+            "file_size": 4,
+            "total_chunks": 1,
+            "target_version": "1.0.8",
+        })
+        mismatched = struct.pack(FILE_HEADER_FORMAT, 1, 1, 4) + b"data"
+        assert client.handle_data({
+            "transfer_id": "t1",
+            "chunk_index": 0,
+            "data": base64.b64encode(mismatched).decode("ascii"),
+        }) is False
+
+        chunk = struct.pack(FILE_HEADER_FORMAT, 1, 0, 4) + b"data"
+        params = {
+            "transfer_id": "t1",
+            "chunk_index": 0,
+            "data": base64.b64encode(chunk).decode("ascii"),
+        }
+        assert client.handle_data(params) is True
+        assert client.handle_data(params) is True
+        assert client._active_transfer["received_chunks"] == 1
+        client.cancel()
+
+    def test_incomplete_update_is_rejected_before_signature_verification(self):
+        from common.file_transfer import CHUNK_SIZE
+
+        client = self._create_client()
+        client.handle_start({
+            "transfer_id": "t1",
+            "file_name": "update.zip",
+            "file_size": CHUNK_SIZE + 1,
+            "total_chunks": 2,
+            "target_version": "1.0.8",
+        })
+
+        with patch("student.core.update_client.verify_manifest") as verify:
+            assert client.handle_end({"transfer_id": "t1"}) is False
+
+        verify.assert_not_called()
+
+    def test_update_start_rejects_inconsistent_chunk_count(self):
+        client = self._create_client()
+
+        with pytest.raises(ValueError, match="metadata"):
+            client.handle_start({
+                "transfer_id": "t1",
+                "file_name": "update.zip",
+                "file_size": 4,
+                "total_chunks": 2,
+                "target_version": "1.0.8",
+            })
+
+    def test_service_install_layout_uses_parent_of_service_directory(self):
+        from student.core.update_client import UpdateClient
+
+        client = UpdateClient(self.send_func, service_mode=True)
+        executable = os.path.join(
+            "C:\\Program Files", "LanClassroom", "Student", "Service",
+            UpdateClient.SERVICE_EXE,
+        )
+        with patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "executable", executable
+        ):
+            layout = client._resolve_install_layout()
+
+        assert layout["service_layout"] is True
+        assert layout["target_dir"] == os.path.join(
+            "C:\\Program Files", "LanClassroom", "Student"
+        )
+
+    def test_service_updater_uses_scm_directory_swap_and_rollback(self):
+        from student.core.update_client import UpdateClient
+
+        script = UpdateClient._build_updater_script(
+            zip_path=r"C:\Temp\student.zip",
+            staging_dir=r"C:\Program Files\LanClassroom\Student\.update-staging",
+            target_dir=r"C:\Program Files\LanClassroom\Student",
+            target_version="2.1.0",
+            restart_cmd="",
+            service_layout=True,
+            current_pid=42,
+        )
+
+        assert 'sc stop "LanClassroomStudentV2"' in script
+        assert 'taskkill /IM "LanClassroom-Student-Agent.exe" /F' in script
+        assert 'LanClassroom-Student-Service.exe" --wait 20 start' in script
+        assert ".Service.rollback" in script
+        assert ".Agent.rollback" in script
+        assert "Expand-Archive" not in script
+
+    def test_update_rejects_version_with_batch_metacharacters(self, tmp_path):
+        client = self._create_client()
+        package = tmp_path / "student.zip"
+        with zipfile.ZipFile(str(package), "w") as archive:
+            archive.writestr("student.exe", b"binary")
+
+        assert client._apply_update(str(package), "2.1.0&whoami") is False
 
 
 # --------------------------------------------------------------------
@@ -142,12 +248,26 @@ class TestUpdateServer:
         self.update_zip = os.path.join(self.tmp_dir, "update.zip")
         with zipfile.ZipFile(self.update_zip, "w") as zf:
             zf.writestr("version.txt", "1.0.8")
+        with open(self.update_zip + ".manifest.json", "wb") as handle:
+            handle.write(b"{}")
+        with open(self.update_zip + ".sig", "w", encoding="ascii") as handle:
+            handle.write("test-signature")
+        self.verify_patcher = patch(
+            "teacher.core.update_server.verify_manifest", return_value={}
+        )
+        self.key_patcher = patch(
+            "teacher.core.update_server.load_public_key", return_value=b"test-key"
+        )
+        self.verify_patcher.start()
+        self.key_patcher.start()
 
         self.student_manager = MagicMock()
         self.file_distributor = MagicMock()
         self.file_distributor.send_file_to_students.return_value = "transfer_id_1"
 
     def teardown_method(self):
+        self.verify_patcher.stop()
+        self.key_patcher.stop()
         if os.path.exists(self.tmp_dir):
             shutil.rmtree(self.tmp_dir)
 

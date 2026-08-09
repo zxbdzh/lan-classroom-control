@@ -3,7 +3,7 @@ import sys
 from typing import Optional
 
 # 内置默认版本号，作为 version.txt 缺失时的兜底
-APP_VERSION = "1.0.7"
+APP_VERSION = "2.0.0"
 
 
 def _get_base_dir() -> str:

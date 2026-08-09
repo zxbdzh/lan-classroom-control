@@ -164,7 +164,7 @@ class StudentAppUI(QObject):
             return
         try:
             if enable:
-                self.overlay.show_black_screen()
+                self.overlay.show_black_screen(self.client.black_screen_message)
             else:
                 if not self.client.is_broadcasting:
                     self.overlay.hide_overlay()
@@ -277,6 +277,8 @@ def main():
     try:
         if not acquire_single_instance_lock():
             sys.exit(0)
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = StudentAppUI()
         sys.exit(app.run())
     except Exception as e:

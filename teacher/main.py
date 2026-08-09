@@ -4,6 +4,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt
 from teacher.ui.main_window import TeacherMainWindow
 from common.logger import get_logger
 
@@ -11,6 +12,8 @@ logger = get_logger("teacher_app")
 
 
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setApplicationName("局域网机房控制系统 - 教师端")
 

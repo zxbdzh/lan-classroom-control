@@ -1,11 +1,14 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$studentExe = Join-Path $root "dist\LanClassroom-Student\LanClassroom-Student.exe"
+$serviceExe = Join-Path $root "dist\LanClassroom-Student-Service\LanClassroom-Student-Service.exe"
+$agentExe = Join-Path $root "dist\LanClassroom-Student-Agent\LanClassroom-Student-Agent.exe"
 $scriptPath = Join-Path $root "installer\student.iss"
 
-if (-not (Test-Path $studentExe)) {
-    throw "Student build not found: $studentExe. Build the PyInstaller onedir first."
+foreach ($artifact in @($serviceExe, $agentExe)) {
+    if (-not (Test-Path $artifact)) {
+        throw "Student build not found: $artifact. Build both PyInstaller onedir targets first."
+    }
 }
 
 $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
@@ -21,4 +24,8 @@ if (-not $iscc) {
 }
 
 $isccPath = if ($iscc.Source) { $iscc.Source } else { $iscc.FullName }
-& $isccPath $scriptPath
+$version = (Get-Content (Join-Path $root "version.txt") -Raw).Trim()
+if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z]+)*$') {
+    throw "Invalid version.txt value: $version"
+}
+& $isccPath "/DAppVersion=$version" $scriptPath

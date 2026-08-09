@@ -13,7 +13,10 @@ class TestConfig:
             assert config.get("teacher.tcp_port") == 9528
             assert config.get("teacher.udp_broadcast_port") == 9527
             assert config.get("student.auto_connect") is True
-            assert config.get("ui.theme") == "default"
+            assert config.get("ui.theme") == "light"
+            assert config.get("teacher.inspection_port") == 9530
+            assert config.get("teacher.bulk_port") == 9531
+            assert config.get("teacher.heartbeat_timeout") == 10
 
     def test_get_set(self):
         with tempfile.TemporaryDirectory() as tmpdir:

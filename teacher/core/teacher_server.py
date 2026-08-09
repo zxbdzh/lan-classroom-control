@@ -1,12 +1,17 @@
 import os
 import base64
 import time
+import threading
+from dataclasses import replace
 from typing import List, Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
 from common.tcp_conn import TCPServer, TCPConnection
 from common.discover import TeacherDiscover
 from common.heartbeat import TeacherHeartbeatManager
 from common.logger import get_logger
+from common.config import get_config
+from common.v2.control import AckStage, ControlEnvelope, MessageKind
+from teacher.core.classroom import TransportAck, TransportDevice
 from teacher.core.student_manager import StudentManager, StudentInfo
 from teacher.core.screen_broadcast import ScreenBroadcaster
 from teacher.core.file_distributor import FileDistributor
@@ -17,6 +22,7 @@ logger = get_logger("teacher_core")
 
 class TeacherServer:
     def __init__(self, tcp_port: int = 9528, broadcast_port: int = 9527):
+        self.config = get_config()
         self.tcp_port = tcp_port
         self.broadcast_port = broadcast_port
 
@@ -25,7 +31,9 @@ class TeacherServer:
             broadcast_port=broadcast_port,
             tcp_port=tcp_port
         )
-        self.heartbeat_manager = TeacherHeartbeatManager(timeout=15)
+        self.heartbeat_manager = TeacherHeartbeatManager(
+            timeout=int(self.config.get("teacher.heartbeat_timeout", 10))
+        )
         self.student_manager = StudentManager()
         self.screen_broadcaster = ScreenBroadcaster(fps=20, quality=70)
         self.file_distributor = FileDistributor()
@@ -37,6 +45,11 @@ class TeacherServer:
         self.on_discovered_student: Optional[Callable] = None
         self.on_discovered_lost: Optional[Callable] = None
         self.on_student_screen_frame: Optional[Callable] = None
+        self._v2_ack_handler: Optional[Callable[[TransportAck], None]] = None
+        self._v2_device_handler: Optional[Callable[[TransportDevice], None]] = None
+        self._v2_identity_resolver: Optional[Callable[[str, str], tuple]] = None
+        self._teacher_heartbeat_stop = threading.Event()
+        self._teacher_heartbeat_thread = None
 
         self._setup_callbacks()
 
@@ -58,20 +71,53 @@ class TeacherServer:
         self.tcp_server.start()
         self.discover.start()
         self.heartbeat_manager.start()
+        self._start_teacher_heartbeat()
         logger.info(f"Teacher server started, TCP port: {self.tcp_port}")
 
     def stop(self):
+        self._stop_teacher_heartbeat()
         self.screen_broadcaster.stop()
         self.heartbeat_manager.stop()
         self.discover.stop()
         self.tcp_server.stop()
         logger.info("Teacher server stopped")
 
+    def _start_teacher_heartbeat(self):
+        if self._teacher_heartbeat_thread and self._teacher_heartbeat_thread.is_alive():
+            return
+        self._teacher_heartbeat_stop.clear()
+        self._teacher_heartbeat_thread = threading.Thread(
+            target=self._teacher_heartbeat_loop,
+            name="teacher-lease-heartbeat",
+            daemon=True,
+        )
+        self._teacher_heartbeat_thread.start()
+
+    def _stop_teacher_heartbeat(self):
+        self._teacher_heartbeat_stop.set()
+        thread = self._teacher_heartbeat_thread
+        self._teacher_heartbeat_thread = None
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def _teacher_heartbeat_loop(self):
+        interval = max(1.0, float(self.config.get("teacher.heartbeat_interval", 3)))
+        lease_seconds = float(self.config.get("teacher.control_lease_seconds", 10))
+        while not self._teacher_heartbeat_stop.is_set():
+            self.tcp_server.broadcast_message(build_message(
+                MessageType.TEACHER_HEARTBEAT,
+                {"timestamp": time.time(), "lease_seconds": lease_seconds},
+            ))
+            self._teacher_heartbeat_stop.wait(interval)
+
     def _on_connect(self, conn: TCPConnection):
         pass
 
     def _on_message(self, conn: TCPConnection, msg: dict):
         try:
+            if msg.get("kind") == MessageKind.ACK.value:
+                self._handle_v2_ack(conn, msg)
+                return
             msg_type = parse_message_type(msg)
             params = msg.get("params", {})
             if msg_type == MessageType.STUDENT_REGISTER:
@@ -79,7 +125,7 @@ class TeacherServer:
             elif msg_type == MessageType.STUDENT_HEARTBEAT:
                 self._handle_heartbeat(conn, params)
             elif msg_type == MessageType.FILE_SEND_ACK:
-                self._handle_file_ack(params)
+                self._handle_file_ack(conn, params)
             elif msg_type == MessageType.UPDATE_REQUEST:
                 self.update_server.on_update_request(conn, params)
             elif msg_type == MessageType.UPDATE_PROGRESS:
@@ -93,9 +139,14 @@ class TeacherServer:
 
     def _on_disconnect(self, conn: TCPConnection):
         if conn.student_id:
+            current = self.student_manager.get_student(conn.student_id)
+            if current is not None and current.conn is not conn:
+                self.screen_broadcaster.remove_target(conn)
+                return
             self.student_manager.set_student_offline(conn.student_id)
             self.heartbeat_manager.remove_student(conn.student_id)
             self.screen_broadcaster.remove_target(conn)
+            self._emit_v2_device(conn.student_id, online=False)
 
     def _on_student_timeout(self, student_id: str):
         self.student_manager.set_student_offline(student_id)
@@ -106,13 +157,25 @@ class TeacherServer:
     def _handle_student_register(self, conn: TCPConnection, params: dict):
         student_id = params.get("student_id", "")
         hostname = params.get("hostname", "unknown")
-        ip = params.get("ip", conn.addr[0])
+        ip = conn.addr[0] if conn.addr and conn.addr[0] else params.get("ip", "")
         mac = params.get("mac", "")
         version = params.get("version", "")
+        protocol_version = int(params.get("protocol_version", 1) or 1)
 
         existing_by_mac = self.student_manager.find_by_mac(mac) if mac else None
+        replaced_connection = None
+        resolved_group = "default"
         if existing_by_mac and existing_by_mac.student_id != student_id:
             student_id = existing_by_mac.student_id
+            resolved_group = existing_by_mac.group
+        elif self._v2_identity_resolver is not None:
+            resolved = self._v2_identity_resolver(str(student_id), str(mac))
+            if resolved:
+                student_id, resolved_group = str(resolved[0]), str(resolved[1])
+
+        existing = self.student_manager.get_student(student_id)
+        if existing is not None and existing.conn is not conn:
+            replaced_connection = existing.conn
 
         conn.student_id = student_id
         student = StudentInfo(
@@ -123,9 +186,15 @@ class TeacherServer:
             version=version,
             conn=conn
         )
+        student.group = resolved_group
         self.student_manager.add_student(student)
+        student.status["protocol_version"] = protocol_version
+        student.status["capabilities"] = list(params.get("capabilities", []))
         self.heartbeat_manager.register_student(student_id)
         logger.info(f"Student registered: {hostname} ({ip}) [{mac}]")
+        self._emit_v2_device(student_id, online=True)
+        if replaced_connection is not None:
+            replaced_connection.stop()
 
         # 学生注册成功后，如果有待推送的更新包，自动通知新注册的学生
         # 覆盖离线重连后补更新场景
@@ -140,9 +209,13 @@ class TeacherServer:
             self.heartbeat_manager.record_heartbeat(conn.student_id)
             self.student_manager.update_heartbeat(conn.student_id)
 
-    def _handle_file_ack(self, params: dict):
+    def _handle_file_ack(self, conn: TCPConnection, params: dict):
         transfer_id = params.get("transfer_id", "")
         success = params.get("success", False)
+        normalized = dict(params)
+        if conn.student_id:
+            normalized["student_id"] = conn.student_id
+        self.file_distributor.record_ack(normalized)
         logger.debug(f"File ack: {transfer_id}, success={success}")
 
     def _handle_command_ack(self, conn: TCPConnection, params: dict):
@@ -151,8 +224,102 @@ class TeacherServer:
             logger.info("Ignored net_control ack because network control is disabled")
         return
 
+    def _handle_v2_ack(self, conn: TCPConnection, msg: dict):
+        if self._v2_ack_handler is None:
+            return
+        try:
+            envelope = ControlEnvelope(
+                version=int(msg.get("version", 0)),
+                kind=MessageKind(msg.get("kind")),
+                command_id=str(msg.get("command_id", "")),
+                device_id=conn.student_id or msg.get("device_id"),
+                revision=int(msg.get("revision", 0)),
+                issued_at=int((msg.get("timestamps") or {}).get("issued_at", 0)),
+                lease_expires_at=(msg.get("timestamps") or {}).get("lease_expires_at"),
+                action=msg.get("action"),
+                stage=AckStage(msg.get("stage")),
+                error=msg.get("error"),
+                payload=dict(msg.get("payload") or {}),
+            )
+            if envelope.kind is not MessageKind.ACK or not envelope.device_id:
+                return
+            self._v2_ack_handler(
+                TransportAck(
+                    command_id=envelope.command_id,
+                    device_id=envelope.device_id,
+                    phase=envelope.stage,
+                    revision=envelope.revision,
+                    success=envelope.error is None,
+                    detail=envelope.error or str(envelope.payload.get("detail", "")),
+                    payload=dict(envelope.payload),
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Invalid v2 ACK from {conn.addr}: {e}")
+
+    # Classroom control transport interface.  The orchestration module owns
+    # command semantics; this adapter only maps devices and envelopes to TCP.
+    def set_ack_handler(self, handler: Callable[[TransportAck], None]):
+        self._v2_ack_handler = handler
+
+    def set_device_handler(self, handler: Callable[[TransportDevice], None]):
+        self._v2_device_handler = handler
+
+    def set_identity_resolver(self, resolver: Callable[[str, str], tuple]):
+        self._v2_identity_resolver = resolver
+
+    def set_student_group(self, student_ids, group: str) -> int:
+        group_name = str(group or "").strip()
+        if not group_name:
+            raise ValueError("group must not be empty")
+        changed = 0
+        for student_id in student_ids:
+            if self.student_manager.get_student(str(student_id)) is None:
+                continue
+            self.student_manager.set_group(str(student_id), group_name)
+            self._emit_v2_device(str(student_id), online=True)
+            changed += 1
+        return changed
+
+    def devices(self):
+        return tuple(self._to_transport_device(student) for student in self.student_manager.get_all_students())
+
+    def send(self, device_id: str, envelope: ControlEnvelope) -> bool:
+        student = self.student_manager.get_student(device_id)
+        if not student or not student.conn or not student.conn.is_alive():
+            return False
+        targeted = replace(envelope, device_id=str(device_id))
+        return student.conn.send_message(targeted.to_dict())
+
+    def _emit_v2_device(self, student_id: str, online: bool):
+        if self._v2_device_handler is None:
+            return
+        student = self.student_manager.get_student(student_id)
+        if student is None:
+            return
+        student.online = online
+        self._v2_device_handler(self._to_transport_device(student))
+
+    @staticmethod
+    def _to_transport_device(student: StudentInfo) -> TransportDevice:
+        return TransportDevice(
+            device_id=student.student_id,
+            hostname=student.hostname,
+            group=student.group,
+            online=student.online,
+            last_seen=student.last_heartbeat,
+            metadata={
+                "ip": student.ip,
+                "mac": student.mac,
+                "version": student.version,
+                "display_name": student.display_name,
+                "protocol_version": int(student.status.get("protocol_version", 1)),
+                "capabilities": list(student.status.get("capabilities", [])),
+            },
+        )
+
     def _handle_student_screen_frame(self, conn: TCPConnection, params: dict):
-        student_id = params.get("student_id") or conn.student_id
+        student_id = conn.student_id or params.get("student_id")
         frame_b64 = params.get("frame_data", "")
         width = params.get("width", 0)
         height = params.get("height", 0)

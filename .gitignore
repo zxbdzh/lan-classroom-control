@@ -42,6 +42,7 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+.artifacts/
 
 # Config
 .lan_classroom/
