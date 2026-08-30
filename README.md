@@ -1,8 +1,24 @@
+<div align="center">
+
 # 局域网机房控制系统 v2
 
 [English](README.en.md)
 
-面向学校机房和培训教室的 Windows 局域网 C/S 管控系统。教师端以座位拓扑管理 20–60 台固定学生机，学生端由 Windows 服务和登录会话代理协作运行。
+**面向学校机房和培训教室的 Windows 局域网 C/S 管控系统。** 教师端以座位拓扑管理 20–60 台固定学生机，学生端由 Windows 服务和登录会话代理协作运行。
+
+<sub>// 屏幕广播 · 黑屏肃静 · 网络管控 · 文件分发 · 应用策略</sub>
+
+<br />
+
+![Python](https://img.shields.io/badge/Python-3.8-3776ab?logo=python&logoColor=white)
+![PyQt5](https://img.shields.io/badge/PyQt5-5.15.2-41cd52)
+![Platform](https://img.shields.io/badge/Windows-7%20SP1%20%7C%2010%20x64-0078d4?logo=windows&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-pytest%20%C3%9796-f2a1c1)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+</div>
+
+---
 
 ## 功能
 
