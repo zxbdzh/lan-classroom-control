@@ -1,4 +1,4 @@
-"""A separate SYSTEM process releases network restrictions if the service dies."""
+"""A separate SYSTEM process restores temporary controls if the service dies."""
 
 import json
 import os
@@ -10,6 +10,7 @@ from contextlib import contextmanager
 
 from common.logger import get_logger
 from student.core.net_control import NetController
+from student.core.usb_control import UsbStorageController
 from student.core.v2.ultravnc import UltraVNCServer
 
 logger = get_logger("recovery_watchdog")
@@ -63,6 +64,8 @@ class RecoveryWatchdog:
             # 与旧守护进程串行清理，再发布新所有者，避免旧进程解除新课堂状态。
             if not NetController().restore_stale_rules():
                 raise RuntimeError("无法清理上次课堂禁网状态")
+            if not UsbStorageController().restore_stale_policy():
+                raise RuntimeError("无法清理上次课堂 USB 存储限制")
             UltraVNCServer().stop()
             write_state({
                 "owner": self.owner, "pid": os.getpid(),
@@ -149,11 +152,12 @@ def watch(owner: str) -> None:
                 if parent_dead or expired:
                     # 不依赖学生服务自己的 finally；服务被强杀后规则仍能恢复。
                     network_ok = NetController().restore_stale_rules()
+                    usb_ok = UsbStorageController().restore_stale_policy()
                     try:
                         remote_ok = UltraVNCServer().stop()
                     finally:
                         release_agent(state)
-                    if network_ok and remote_ok:
+                    if network_ok and usb_ok and remote_ok:
                         state["active"] = False
                         write_state(state)
                         if parent_dead:

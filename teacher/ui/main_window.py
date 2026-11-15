@@ -375,7 +375,23 @@ class TeacherMainWindow(QMainWindow):
         row.addWidget(update)
         row.addStretch()
         layout.addWidget(band)
-        self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态"))
+        usb_band = QWidget()
+        usb_row = QHBoxLayout(usb_band)
+        usb_row.setContentsMargins(0, 0, 0, 0)
+        usb_row.addWidget(QLabel("USB 存储"))
+        for text, enabled in (("限制 USB 存储", True), ("恢复 USB 存储", False)):
+            button = QPushButton(text)
+            button.clicked.connect(
+                lambda _checked, value=enabled: self._set_usb_storage_blocked(value)
+            )
+            usb_row.addWidget(button)
+        usb_row.addStretch()
+        layout.addWidget(usb_band)
+        usb_hint = QLabel("限制可移动磁盘的读写和执行，不影响键鼠；已挂载设备可能需重新插拔或重启。")
+        usb_hint.setWordWrap(True)
+        usb_hint.setProperty("muted", True)
+        layout.addWidget(usb_hint)
+        self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态", "USB 策略"))
         layout.addWidget(self.maintenance_table, 1)
         return page
 
@@ -533,6 +549,12 @@ class TeacherMainWindow(QMainWindow):
     def _block_network(self) -> None:
         cidrs = [item.strip() for item in self.config.get("teacher.internal_cidrs", []) if item.strip()]
         self._submit(lambda scope: self.runtime.set_network_blocked(scope, True, cidrs), "外网限制已下发")
+
+    def _set_usb_storage_blocked(self, enabled: bool) -> None:
+        self._submit(
+            lambda scope: self.runtime.set_usb_storage_blocked(scope, enabled),
+            "USB 存储限制已下发" if enabled else "USB 存储恢复已下发",
+        )
 
     def _restore_all(self) -> None:
         self._submit(self.runtime.restore_all, "临时控制已恢复")
@@ -911,6 +933,21 @@ class TeacherMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "无法部署更新", str(exc))
 
+    @staticmethod
+    def _usb_storage_status(device) -> str:
+        # 回执只证明策略落盘，不能把“已下发”或离线设备显示成即时封禁成功。
+        if not device.online:
+            return "离线 / 未确认"
+        expected = device.expected_for("usb_storage")
+        actual = device.actual_for("usb_storage")
+        if expected is not None and (
+            actual is None or actual.command_revision != expected.command_revision
+        ):
+            return "待确认"
+        if actual is not None:
+            return "限制策略已应用" if actual.value else "原策略已恢复"
+        return "未下发"
+
     def _refresh_device_tables(self) -> None:
         devices = tuple(self._snapshot.devices) if self._snapshot else ()
         current = self.process_device.currentData()
@@ -935,6 +972,7 @@ class TeacherMainWindow(QMainWindow):
                 device.hostname, meta.get("ip", ""), meta.get("mac", ""),
                 meta.get("os", "Windows"), meta.get("version", ""),
                 "在线" if device.online else "离线",
+                self._usb_storage_status(device),
             )
             for column, value in enumerate(values):
                 self.maintenance_table.setItem(row, column, QTableWidgetItem(str(value)))

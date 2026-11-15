@@ -359,6 +359,7 @@ class OperationDrawer(QWidget):
             "broadcast.start": "开始广播", "broadcast.stop": "停止广播",
             "silence.start": "黑屏肃静", "silence.stop": "解除肃静",
             "network.block": "禁止外网", "network.restore": "恢复网络",
+            "usb_storage.block": "限制 USB 存储", "usb_storage.restore": "恢复 USB 存储",
             "classroom.restore_all": "全部恢复", "process.terminate": "结束进程",
             "blacklist.set": "添加应用策略", "blacklist.clear": "解除应用策略",
             "power.off": "关机", "power.reboot": "重启", "power.logoff": "注销",

@@ -138,15 +138,43 @@ def test_watchdog_recovers_dead_service_without_running_native_controls():
         watchdog, "read_state", return_value=state
     ), patch.object(watchdog, "write_state") as saved, patch.object(
         watchdog, "NetController"
-    ) as network, patch.object(watchdog, "UltraVNCServer") as remote, patch.object(
+    ) as network, patch.object(watchdog, "UsbStorageController") as usb, patch.object(
+        watchdog, "UltraVNCServer"
+    ) as remote, patch.object(
         watchdog, "release_agent"
     ) as release, patch("psutil.Process", side_effect=psutil.NoSuchProcess(123)):
         network.return_value.restore_stale_rules.return_value = True
+        usb.return_value.restore_stale_policy.return_value = True
         remote.return_value.stop.return_value = True
         watchdog.watch("old")
     network.return_value.restore_stale_rules.assert_called_once()
+    usb.return_value.restore_stale_policy.assert_called_once()
     remote.return_value.stop.assert_called_once()
     release.assert_called_once()
+    assert saved.call_args.args[0]["active"] is False
+
+
+def test_watchdog_retries_usb_restore_before_marking_recovered():
+    from contextlib import nullcontext
+    import psutil
+    from student.core.v2 import recovery_watchdog as watchdog
+    state = {"owner": "old", "pid": 123, "created": 1.0, "active": True, "deadline": 30}
+    with patch.object(watchdog, "recovery_lock", side_effect=nullcontext), patch.object(
+        watchdog, "read_state", return_value=state
+    ), patch.object(watchdog, "write_state") as saved, patch.object(
+        watchdog, "NetController"
+    ) as network, patch.object(watchdog, "UsbStorageController") as usb, patch.object(
+        watchdog, "UltraVNCServer"
+    ) as remote, patch.object(watchdog, "release_agent"), patch(
+        "psutil.Process", side_effect=psutil.NoSuchProcess(123)
+    ), patch.object(watchdog.time, "sleep") as wait:
+        network.return_value.restore_stale_rules.return_value = True
+        remote.return_value.stop.return_value = True
+        usb.return_value.restore_stale_policy.side_effect = [False, True]
+        watchdog.watch("old")
+    assert usb.return_value.restore_stale_policy.call_count == 2
+    wait.assert_called_once_with(0.5)
+    saved.assert_called_once()
     assert saved.call_args.args[0]["active"] is False
 
 

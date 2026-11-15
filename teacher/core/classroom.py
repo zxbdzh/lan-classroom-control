@@ -598,6 +598,8 @@ class Classroom:
             return (("silence", kind == CommandKind.SILENCE_START),)
         if kind in (CommandKind.NETWORK_BLOCK, CommandKind.NETWORK_RESTORE):
             return (("network", kind == CommandKind.NETWORK_BLOCK),)
+        if kind in (CommandKind.USB_STORAGE_BLOCK, CommandKind.USB_STORAGE_RESTORE):
+            return (("usb_storage", kind == CommandKind.USB_STORAGE_BLOCK),)
         if kind in (CommandKind.INPUT_LOCK, CommandKind.INPUT_UNLOCK):
             return (("input", kind == CommandKind.INPUT_LOCK),)
         if kind in (CommandKind.INSPECTION_OPEN, CommandKind.INSPECTION_CLOSE):
@@ -619,6 +621,7 @@ class Classroom:
                     "broadcast",
                     "silence",
                     "network",
+                    "usb_storage",
                     "input",
                     "inspection",
                     "remote_control",

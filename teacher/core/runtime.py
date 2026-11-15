@@ -15,6 +15,7 @@ from common.v2.model import (
     InspectionMode,
     TargetScope,
     InspectionSession,
+    OperationReceipt,
     Group,
     DeviceIds,
 )
@@ -150,6 +151,15 @@ class TeacherRuntime:
         return self.submit(
             ClassroomAction(kind, {"allowed_cidrs": list(allowed_cidrs)}), scope
         )
+
+    def set_usb_storage_blocked(
+        self, scope: TargetScope, enabled: bool
+    ) -> OperationReceipt:
+        kind = (
+            CommandKind.USB_STORAGE_BLOCK if enabled
+            else CommandKind.USB_STORAGE_RESTORE
+        )
+        return self.submit(ClassroomAction(kind), scope)
 
     def start_broadcast(
         self,

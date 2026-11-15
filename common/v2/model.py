@@ -70,6 +70,8 @@ class CommandKind(str, Enum):
     SILENCE_STOP = "silence.stop"
     NETWORK_BLOCK = "network.block"
     NETWORK_RESTORE = "network.restore"
+    USB_STORAGE_BLOCK = "usb_storage.block"
+    USB_STORAGE_RESTORE = "usb_storage.restore"
     INPUT_LOCK = "input.lock"
     INPUT_UNLOCK = "input.unlock"
     INSPECTION_OPEN = "inspection.open"
@@ -103,6 +105,7 @@ TEMPORARY_COMMANDS = frozenset(
         CommandKind.BROADCAST_START,
         CommandKind.SILENCE_START,
         CommandKind.NETWORK_BLOCK,
+        CommandKind.USB_STORAGE_BLOCK,
         CommandKind.INPUT_LOCK,
         CommandKind.INSPECTION_OPEN,
         CommandKind.REMOTE_CONTROL_START,

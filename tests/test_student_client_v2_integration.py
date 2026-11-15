@@ -6,6 +6,11 @@ import time
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
+import pytest
+
+from student.core.usb_control import UsbStorageController
+from student.core.v2.lease import TemporaryControlKind
+
 from common.v2.control import AckStage, ControlEnvelope
 from common.v2.model import CommandKind
 from common.file_transfer import TARGET_DIR_DEFAULT
@@ -108,6 +113,110 @@ def test_student_client_sends_received_and_applied_ack_for_v2_command():
     assert acknowledgements[-1]["device_id"] == "seat-bound-id"
     assert client.is_black_screen is True
     client.stop()
+
+
+@pytest.fixture
+def usb_client():
+    client = client_with_memory_state(service_mode=True)
+    controller = MagicMock(spec=UsbStorageController)
+    controller.POLICY_NOTICE = UsbStorageController.POLICY_NOTICE
+    controller.last_error = "access denied"
+    controller.is_blocked.return_value = False
+
+    def block():
+        controller.is_blocked.return_value = True
+        return True
+
+    def restore():
+        controller.is_blocked.return_value = False
+        return True
+
+    controller.block_storage.side_effect = block
+    controller.restore_storage.side_effect = restore
+    client.usb_controller = controller
+    client.tcp_client.send_message = MagicMock(return_value=True)
+    try:
+        yield client, controller
+    finally:
+        controller.restore_storage.side_effect = restore
+        client.stop()
+
+
+def usb_acks(client):
+    return [call.args[0] for call in client.tcp_client.send_message.call_args_list
+            if call.args[0].get("kind") == "ack"]
+
+
+def test_usb_commands_execute_in_service_without_desktop_and_deduplicate(usb_client):
+    client, controller = usb_client
+    command = ControlEnvelope.command(CommandKind.USB_STORAGE_BLOCK.value, {}, revision=4)
+    client._execute_v2_command(command)
+    client._execute_v2_command(command)
+    controller.block_storage.assert_called_once_with()
+    acks = usb_acks(client)
+    assert [item["stage"] for item in acks] == ["received", "applied"] * 2
+    assert acks[-1]["payload"]["duplicate"] is True
+    assert acks[-1]["payload"]["usb_storage_policy_applied"] is True
+    assert "notice" in acks[-1]["payload"]
+    assert TemporaryControlKind.USB_STORAGE_BLOCK in client.temporary_lease.active_controls()
+
+    client._execute_v2_command(ControlEnvelope.command(CommandKind.USB_STORAGE_RESTORE.value, {}))
+    controller.restore_storage.assert_called_once_with()
+    assert usb_acks(client)[-1]["payload"]["usb_storage_policy_applied"] is False
+    assert TemporaryControlKind.USB_STORAGE_BLOCK not in client.temporary_lease.active_controls()
+
+
+@pytest.mark.parametrize("residual", [False, True])
+def test_usb_block_failure_reports_failed_ack_and_keeps_residual_recovery(usb_client, residual):
+    client, controller = usb_client
+    controller.block_storage.side_effect = None
+    controller.block_storage.return_value = False
+    controller.is_blocked.return_value = residual
+    client._execute_v2_command(ControlEnvelope.command(CommandKind.USB_STORAGE_BLOCK.value, {}))
+    ack = usb_acks(client)[-1]
+    assert ack["stage"] == "applied"
+    assert ack["error"] == "access denied"
+    assert ack["payload"]["status"] == "failed"
+    assert (TemporaryControlKind.USB_STORAGE_BLOCK in client.temporary_lease.active_controls()) is residual
+
+
+@pytest.mark.parametrize("trigger", ["command", "disconnect", "timeout", "stop"])
+def test_usb_policy_restores_through_all_temporary_control_exit_paths(usb_client, trigger):
+    client, controller = usb_client
+    client._v2_usb_storage_block({})
+    if trigger == "command":
+        assert client._v2_restore_all({})["blacklist_preserved"] is True
+    elif trigger == "disconnect":
+        client._on_disconnected()
+    elif trigger == "timeout":
+        client.temporary_lease._deadline = 0
+        assert client.temporary_lease.check_expired()[0].success
+    else:
+        client.stop()
+    controller.restore_storage.assert_called_once_with()
+    assert TemporaryControlKind.USB_STORAGE_BLOCK not in client.temporary_lease.active_controls()
+
+
+def test_usb_restore_failure_returns_failed_ack_and_retries_on_lease(usb_client):
+    client, controller = usb_client
+    client._v2_usb_storage_block({})
+    controller.restore_storage.side_effect = [False, True]
+    client._execute_v2_command(ControlEnvelope.command(CommandKind.USB_STORAGE_RESTORE.value, {}))
+    assert usb_acks(client)[-1]["payload"]["status"] == "failed"
+    assert TemporaryControlKind.USB_STORAGE_BLOCK in client.temporary_lease.active_controls()
+    client.temporary_lease._deadline = 0
+    assert client.temporary_lease.check_expired()[0].success
+    assert TemporaryControlKind.USB_STORAGE_BLOCK not in client.temporary_lease.active_controls()
+
+
+def test_stale_usb_lease_callback_cannot_release_a_new_policy(usb_client):
+    client, controller = usb_client
+    client._v2_usb_storage_block({})
+    old_restore = client.temporary_lease._active[TemporaryControlKind.USB_STORAGE_BLOCK]
+    client._v2_usb_storage_block({})
+    assert old_restore() is True
+    controller.restore_storage.assert_not_called()
+    assert TemporaryControlKind.USB_STORAGE_BLOCK in client.temporary_lease.active_controls()
 
 
 def test_remote_input_executes_inline_to_preserve_tcp_order():

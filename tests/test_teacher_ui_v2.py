@@ -10,7 +10,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidgetItem
 from PyQt5.QtGui import QPixmap
 
-from teacher.core.classroom import TransportDevice
+from teacher.core.classroom import AckPhase, InMemoryTransport, TransportDevice
 from teacher.core.runtime import TeacherRuntime
 from common.v2.model import CommandKind, DeviceIds, InspectionMode
 from teacher.ui.main_window import TeacherMainWindow
@@ -72,6 +72,58 @@ def test_teacher_console_compacts_for_1366_screen_at_125_percent(qtbot):
     assert not window.operation_drawer.isVisible()
     assert not window.drawer_button.isChecked()
     assert window.pages.geometry().width() > 700
+    window.close()
+
+
+@pytest.mark.parametrize("scope_name", ["all", "group", "selected"])
+def test_usb_buttons_use_current_scope_and_show_confirmed_policy(qtbot, scope_name):
+    transport = InMemoryTransport()
+    transport.scan_devices = MagicMock()
+    transport.file_distributor = MagicMock()
+    transport.connect("pc-01", "PC-01", "第一组")
+    transport.connect("pc-02", "PC-02", "第二组")
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window.resize(1093, 614)
+    window.show()
+    window._show_page("maintenance")
+    window._poll_runtime()
+    window._selected_ids = {"pc-01"}
+    window.scope_buttons[scope_name].setChecked(True)
+    if scope_name == "group":
+        window.group_combo.setCurrentText("第一组")
+    window._scope_changed()
+    QApplication.processEvents()
+    assert window.maintenance_table.item(0, 6).text() == "未下发"
+
+    for label, expected_kind in (
+        ("限制 USB 存储", CommandKind.USB_STORAGE_BLOCK),
+        ("恢复 USB 存储", CommandKind.USB_STORAGE_RESTORE),
+    ):
+        button = next(item for item in window.findChildren(QPushButton) if item.text() == label)
+        assert button.isVisible()
+        page = window.pages.currentWidget()
+        right = button.mapTo(page, button.rect().bottomRight()).x()
+        assert right <= page.width()
+        with qtbot.captureExceptions() as exceptions:
+            qtbot.mouseClick(button, Qt.LeftButton)
+        assert not exceptions
+        receipt = runtime.snapshot().operations[-1]
+        assert receipt.action.kind is expected_kind
+        assert receipt.target_ids == (("pc-01", "pc-02") if scope_name == "all" else ("pc-01",))
+        window._poll_runtime()
+        assert window.maintenance_table.item(0, 6).text() == "待确认"
+        for device_id in receipt.target_ids:
+            transport.ack(receipt.command_id, device_id, AckPhase.APPLIED, receipt.revision)
+        window._poll_runtime()
+        assert window.maintenance_table.item(0, 6).text() == (
+            "限制策略已应用" if expected_kind is CommandKind.USB_STORAGE_BLOCK else "原策略已恢复"
+        )
+        assert label in window.operation_drawer.list.item(0).text()
+    transport.disconnect("pc-01")
+    window._poll_runtime()
+    assert window.maintenance_table.item(0, 6).text() == "离线 / 未确认"
     window.close()
 
 

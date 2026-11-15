@@ -129,6 +129,37 @@ def test_applied_ack_updates_actual_state(rig):
     )
 
 
+@pytest.mark.parametrize("restore_kind", [
+    CommandKind.USB_STORAGE_RESTORE, CommandKind.RESTORE_ALL,
+])
+def test_usb_policy_uses_scope_ack_and_restore_domain(rig, restore_kind):
+    _, transport, classroom = rig
+    blocked = classroom.submit(ClassroomAction(CommandKind.USB_STORAGE_BLOCK), Group("front"))
+    assert blocked.target_ids == ("pc-01",)
+    assert blocked.expires_at is not None
+    transport.ack(blocked.command_id, "pc-01", AckPhase.APPLIED, blocked.revision)
+    assert classroom.snapshot().device("pc-01").actual_for("usb_storage").value is True
+    assert classroom.snapshot().device("pc-02").expected_for("usb_storage") is None
+
+    restored = classroom.submit(ClassroomAction(restore_kind), Group("front"))
+    transport.ack(restored.command_id, "pc-01", AckPhase.APPLIED, restored.revision)
+    assert classroom.snapshot().device("pc-01").actual_for("usb_storage").value is False
+
+
+def test_usb_policy_expires_on_disconnect_without_reapplying_on_reconnect(rig):
+    _, transport, classroom = rig
+    receipt = classroom.submit(ClassroomAction(CommandKind.USB_STORAGE_BLOCK), Group("front"))
+    transport.ack(receipt.command_id, "pc-01", AckPhase.APPLIED, receipt.revision)
+    transport.disconnect("pc-01")
+    assert classroom.snapshot().operation(receipt.command_id).status_for("pc-01").state is (
+        DeviceCommandState.EXPIRED
+    )
+    assert classroom.snapshot().device("pc-01").actual_for("usb_storage") is None
+    sent_count = len(transport.sent)
+    transport.connect("pc-01", "PC-01", "front")
+    assert len(transport.sent) == sent_count
+
+
 def test_new_revision_supersedes_pending_and_ignores_late_ack(rig):
     _, transport, classroom = rig
     first = classroom.submit(

@@ -16,6 +16,7 @@ class TemporaryControlKind(str, Enum):
     INSPECTION = "inspection"
     REMOTE_CONTROL = "remote_control"
     INTERNET_BLOCK = "internet_block"
+    USB_STORAGE_BLOCK = "usb_storage_block"
 
 
 @dataclass(frozen=True)

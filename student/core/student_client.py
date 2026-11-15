@@ -25,6 +25,7 @@ from common.v2.media_transport import (
 )
 from common.v2.model import CommandKind
 from student.core.net_control import NetController
+from student.core.usb_control import UsbStorageController
 from student.core.v2.blacklist import BlacklistEnforcer
 from student.core.v2.command import Command, CommandHandlerResult, CommandOutcome, OutcomeStatus
 from student.core.v2.lease import TemporaryControlKind, TemporaryControlLease
@@ -47,6 +48,7 @@ V2_CAPABILITIES = (
     "inspection_primary",
     "broadcast_all_monitors",
     "network_external_only",
+    "usb_storage_policy",
     "process_list",
     "process_terminate",
     "process_blacklist",
@@ -91,6 +93,9 @@ class StudentClient:
         )
         self.input_blocker = None
         self.net_controller = NetController()
+        self.usb_controller = UsbStorageController()
+        self._usb_control_lock = threading.RLock()
+        self._usb_control_generation = 0
         self.vnc_server = UltraVNCServer()
         self.recovery_guard = None
         self._remote_active = False
@@ -335,6 +340,15 @@ class StudentClient:
             self.net_controller.restore_stale_rules()
         except Exception as exc:
             logger.warning(f"Restore stale network rules failed: {exc}")
+        # 启动先恢复上次服务中断遗留的策略，失败则交给租约继续重试。
+        with self._usb_control_lock:
+            if not self.usb_controller.restore_stale_policy() and self.usb_controller.is_blocked():
+                self._usb_control_generation += 1
+                generation = self._usb_control_generation
+                self._activate_lease(
+                    TemporaryControlKind.USB_STORAGE_BLOCK,
+                    lambda: self._restore_usb_storage(generation),
+                )
         self.command_runtime.start()
         self.blacklist_enforcer.start()
         self.discover_listener.start()
@@ -669,6 +683,8 @@ class StudentClient:
             CommandKind.SILENCE_STOP.value: self._v2_silence_stop,
             CommandKind.NETWORK_BLOCK.value: self._v2_network_block,
             CommandKind.NETWORK_RESTORE.value: self._v2_network_restore,
+            CommandKind.USB_STORAGE_BLOCK.value: self._v2_usb_storage_block,
+            CommandKind.USB_STORAGE_RESTORE.value: self._v2_usb_storage_restore,
             CommandKind.INPUT_LOCK.value: self._v2_input_lock,
             CommandKind.INPUT_UNLOCK.value: self._v2_input_unlock,
             CommandKind.INSPECTION_OPEN.value: self._v2_inspection_open,
@@ -853,6 +869,52 @@ class StudentClient:
         self.temporary_lease.deactivate(TemporaryControlKind.INTERNET_BLOCK)
         return {"network_blocked": False}
 
+    def _v2_usb_storage_block(self, params: Mapping[str, object]):
+        with self._usb_control_lock:
+            self._usb_control_generation += 1
+            generation = self._usb_control_generation
+            # 先登记恢复，再改策略；即使部分写入或服务中断也能按原值回滚。
+            self._activate_lease(
+                TemporaryControlKind.USB_STORAGE_BLOCK,
+                lambda: self._restore_usb_storage(generation),
+            )
+            if not self.usb_controller.block_storage():
+                if not self.usb_controller.is_blocked():
+                    self.temporary_lease.deactivate(TemporaryControlKind.USB_STORAGE_BLOCK)
+                return CommandHandlerResult.failed(
+                    self.usb_controller.last_error or "USB 存储限制失败"
+                )
+            return {
+                "usb_storage_policy_applied": True,
+                "notice": self.usb_controller.POLICY_NOTICE,
+            }
+
+    def _restore_usb_storage(self, generation: Optional[int] = None) -> bool:
+        with self._usb_control_lock:
+            # 超时检查可能已取出旧回调；它不能解除之后新下发的限制。
+            if generation is not None and generation != self._usb_control_generation:
+                return True
+            return self.usb_controller.restore_storage()
+
+    def _v2_usb_storage_restore(self, params: Mapping[str, object]):
+        with self._usb_control_lock:
+            if not self._restore_usb_storage():
+                if self.usb_controller.is_blocked():
+                    self._usb_control_generation += 1
+                    generation = self._usb_control_generation
+                    self._activate_lease(
+                        TemporaryControlKind.USB_STORAGE_BLOCK,
+                        lambda: self._restore_usb_storage(generation),
+                    )
+                return CommandHandlerResult.failed(
+                    self.usb_controller.last_error or "USB 存储恢复失败，正在重试"
+                )
+            self.temporary_lease.deactivate(TemporaryControlKind.USB_STORAGE_BLOCK)
+            return {
+                "usb_storage_policy_applied": False,
+                "notice": self.usb_controller.POLICY_NOTICE,
+            }
+
     def _v2_input_lock(self, params: Mapping[str, object]):
         delegated = self._session_action(CommandKind.INPUT_LOCK.value, params)
         if delegated is not None:
@@ -1036,6 +1098,9 @@ class StudentClient:
         self._close_inspection()
         if self.net_controller.is_blocked():
             success = self._handle_net_control({"enable": False}) and success
+        if self.usb_controller.is_blocked():
+            restored = self._v2_usb_storage_restore({})
+            success = isinstance(restored, dict) and success
         return success
 
     def _v2_process_list(self, params: Mapping[str, object]):

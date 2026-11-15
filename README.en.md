@@ -29,6 +29,7 @@
 - **Network control**: blocks external subnets via Windows Firewall while keeping the LAN, teacher address, discovery/media channels, file distribution and configured internal CIDRs
 - **File distribution**: file/folder queue, SHA-256, resume support, safe ZIP extraction; service mode saves to the public desktop "classroom files" folder and never auto-executes
 - **App policies**: per-machine process list; safe process kill by PID + creation time; permanent blacklist by program name and optional full path
+- **USB storage control**: restrict/restore removable-disk read, write and execute access for the class, a group or selected devices; keeps keyboards/mice working, reports per-device policy results and attempts to restore the original policy on disconnect
 - **Device maintenance**: shutdown, reboot, logoff, Wake-on-LAN, device scan
 - **Operation log**: command-level and device-level status; SQLite/WAL persistence, 90-day retention, CSV export
 - **Theme**: light by default, dark supported; target resolution 1366×768, 100%–125% scaling
@@ -51,6 +52,10 @@ uv run student
 ```
 
 Production deployment uses the installer; see the repo for the student-side service architecture.
+
+USB storage controls are under **Device maintenance** and use the current class/group/selection scope. Upgrade both ends; the student needs administrator privileges. Only Windows removable-disk read/write/execute policy is managed, leaving USB controllers, keyboards, mice, hubs and network adapters intact. Fixed-disk-class USB drives, MTP/WPD phones and booting from USB are outside this scope. A successful policy acknowledgement confirms a verified settings write, not immediate removal of access to an already mounted disk: replugging or a restart may be required, and [Microsoft documents that access-right changes may not take effect until an OS restart](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-removablestorage). The app does not force ejection or restart.
+
+USB restrictions are temporary. Explicit restore, Restore all, disconnect, heartbeat expiry, service restart or recovery after a service crash attempt to restore the saved original policy, retaining backups on failure for retry. Pre-existing restrictions are preserved; domain policy may override local settings. This is not a substitute for BIOS boot restrictions or administrator access control.
 
 ## License
 
