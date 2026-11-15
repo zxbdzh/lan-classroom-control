@@ -35,7 +35,7 @@ def stylesheet(theme: str = "light") -> str:
     c = DARK if theme == "dark" else LIGHT
     return """
     * { font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 13px; }
-    QMainWindow, QWidget#Root { background: %(window)s; color: %(ink)s; }
+    QMainWindow, QDialog, QMessageBox, QWidget#Root { background: %(window)s; color: %(ink)s; }
     QWidget#Sidebar, QWidget#CommandBar, QWidget#OperationDrawer,
     QWidget#PageHeader, QStatusBar { background: %(panel)s; }
     QLabel { color: %(ink)s; background: transparent; }

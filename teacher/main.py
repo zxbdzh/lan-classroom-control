@@ -12,6 +12,10 @@ logger = get_logger("teacher_app")
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--diagnostics":
+        from common.diagnostics import startup_probe
+        startup_probe("teacher", sys.argv[2])
+        return
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)

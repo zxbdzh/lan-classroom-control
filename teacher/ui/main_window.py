@@ -342,6 +342,7 @@ class TeacherMainWindow(QMainWindow):
         page, layout = self._page_shell("应用策略", device_bar)
         self.process_table = self._table(("PID", "进程", "路径", "用户", "保护"))
         self.process_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.process_device.currentIndexChanged.connect(self._process_device_changed)
         layout.addWidget(self.process_table, 1)
         self.blacklist_table = self._table(("设备", "程序或路径", "状态"))
         self.blacklist_table.setMaximumHeight(180)
@@ -550,6 +551,8 @@ class TeacherMainWindow(QMainWindow):
 
     def _poll_runtime(self) -> None:
         try:
+            for message in self.runtime.poll_remote_windows():
+                self.operation_status.setText(message)
             snapshot = self.runtime.snapshot(self._last_revision)
         except Exception as exc:
             self.operation_status.setText(f"状态读取失败：{exc}")
@@ -643,6 +646,9 @@ class TeacherMainWindow(QMainWindow):
         self.patrol_grid.setRowStretch((len(self._snapshot.devices) + 3) // 4, 1)
 
     def _open_viewer(self, device_id: str) -> None:
+        if device_id in self.runtime.remote_windows.sessions:
+            self.operation_status.setText("该设备已有 UltraVNC 会话，请使用独立窗口")
+            return
         if not self._snapshot:
             return
         device = self._snapshot.device(device_id)
@@ -664,16 +670,29 @@ class TeacherMainWindow(QMainWindow):
         try:
             if enabled:
                 self.runtime.start_remote_control(device_id)
+                viewer = self._viewers.get(device_id)
+                if viewer:
+                    # 外部 Viewer 接管会话后关闭旧画面，避免继续转发键鼠。
+                    viewer.remote_enabled = False
+                    viewer.close()
             else:
                 self.runtime.stop_remote_control(device_id)
                 self.runtime.open_inspection(
                     DeviceIds([device_id]), InspectionMode.FOCUS
                 )
         except Exception as exc:
+            viewer = self._viewers.get(device_id)
+            if viewer:
+                viewer.remote_enabled = False
+                viewer.remote_button.blockSignals(True)
+                viewer.remote_button.setChecked(False)
+                viewer.remote_button.blockSignals(False)
             QMessageBox.warning(self, "远程控制失败", str(exc))
 
     def _viewer_closed(self, device_id: str) -> None:
         viewer = self._viewers.pop(device_id, None)
+        if device_id in self.runtime.remote_windows.sessions:
+            return
         try:
             if viewer and viewer.remote_enabled:
                 self.runtime.stop_remote_control(device_id)
@@ -727,7 +746,14 @@ class TeacherMainWindow(QMainWindow):
         for index, item in enumerate(self.file_queue):
             if item["status"] not in {"等待", "失败"}:
                 continue
-            transfer_id = self.runtime.server.send_file(item["path"], target_ids)
+            retry_ids = item.get("retry_ids") if item["status"] == "失败" else None
+            effective_ids = (
+                [device_id for device_id in retry_ids if device_id in target_ids]
+                if retry_ids else target_ids
+            )
+            if not effective_ids:
+                continue
+            transfer_id = self.runtime.server.send_file(item["path"], effective_ids)
             item["status"] = "发送中"
             item["transfer_id"] = transfer_id
             self._file_rows[transfer_id] = index
@@ -746,6 +772,18 @@ class TeacherMainWindow(QMainWindow):
             return
         self.file_queue[row]["status"] = "完成" if success else "失败"
         self.file_table.item(row, 4).setText("完成" if success else f"失败：{error}")
+        result = self.runtime.server.file_distributor.get_completed_transfer(transfer_id)
+        if result:
+            self.file_queue[row]["retry_ids"] = [
+                device_id for device_id, status in result["devices"].items()
+                if status["state"] != "complete"
+            ]
+            self.file_table.item(row, 4).setToolTip("\n".join(
+                f"{device_id}：{status['state']} {status['result']}"
+                for device_id, status in result["devices"].items()
+            ))
+        if success:
+            self.file_table.item(row, 3).setText("100%")
 
     def _query_processes(self) -> None:
         device_id = self.process_device.currentData()
@@ -757,6 +795,11 @@ class TeacherMainWindow(QMainWindow):
             self.operation_status.setText("正在读取进程列表")
         except Exception as exc:
             QMessageBox.warning(self, "读取失败", str(exc))
+
+    def _process_device_changed(self, *_args) -> None:
+        # 进程身份只属于查询时的设备，切换或离线后不能继续操作旧列表。
+        self._process_command_id = None
+        self.process_table.setRowCount(0)
 
     def _consume_process_result(self, snapshot) -> None:
         if not self._process_command_id:
@@ -840,7 +883,7 @@ class TeacherMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "无法执行", str(exc))
             return
-        if QMessageBox.question(self, names[kind], f"确定对当前作用域执行{name[kind]}？") != QMessageBox.Yes:
+        if QMessageBox.question(self, names[kind], f"确定对当前作用域执行{names[kind]}？") != QMessageBox.Yes:
             return
         self.runtime.power(scope, kind)
 
@@ -879,6 +922,8 @@ class TeacherMainWindow(QMainWindow):
         if index >= 0:
             self.process_device.setCurrentIndex(index)
         self.process_device.blockSignals(False)
+        if self.process_device.currentData() != current:
+            self._process_device_changed()
         self.maintenance_table.setRowCount(0)
         self.blacklist_table.setRowCount(0)
         for device in devices:

@@ -6,6 +6,7 @@ import base64
 import json
 import threading
 import time
+import queue
 from typing import Mapping, Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
 from common.tcp_conn import TCPClient
@@ -28,9 +29,15 @@ from student.core.v2.blacklist import BlacklistEnforcer
 from student.core.v2.command import Command, CommandHandlerResult, CommandOutcome, OutcomeStatus
 from student.core.v2.lease import TemporaryControlKind, TemporaryControlLease
 from student.core.v2.power import PowerAction, PowerController
-from student.core.v2.processes import ProcessController
+from student.core.v2.processes import (
+    ProcessController, DEFAULT_PROTECTED_PROCESS_NAMES, ProcessTerminationStatus,
+)
 from student.core.v2.runtime import StudentServiceRuntime
-from student.core.v2.storage import StudentStateStore, find_legacy_device_id
+from student.core.v2.storage import (
+    StudentStateStore, find_legacy_device_id,
+    normalize_executable_name, normalize_windows_path,
+)
+from student.core.v2.ultravnc import UltraVNCServer
 
 logger = get_logger("student_core")
 
@@ -43,6 +50,7 @@ V2_CAPABILITIES = (
     "process_list",
     "process_terminate",
     "process_blacklist",
+    "remote_ultravnc",
     "power",
 )
 
@@ -83,6 +91,13 @@ class StudentClient:
         )
         self.input_blocker = None
         self.net_controller = NetController()
+        self.vnc_server = UltraVNCServer()
+        self.recovery_guard = None
+        self._remote_active = False
+        self._command_queue = queue.Queue()
+        self._command_worker = None
+        self._command_worker_lock = threading.Lock()
+        self._stopping = threading.Event()
         self.process_controller = ProcessController()
         self.power_controller = PowerController(allow_execution=True)
         self.remote_input_controller = None
@@ -275,18 +290,22 @@ class StudentClient:
                 for addr in addrs:
                     if addr.family == socket.AF_INET and addr.address == local_ip:
                         has_ip = True
-                    try:
-                        if (addr.family == getattr(psutil, 'AF_LINK', None) or
-                            (hasattr(addr, 'address') and
-                             isinstance(addr.address, str) and
-                             len(addr.address.split(':')) == 6 and
-                             addr.address != '00:00:00:00:00:00')):
-                            if addr.address and addr.address != '00:00:00:00:00:00':
-                                mac_addr = addr.address
-                                if first_valid_mac is None:
-                                    first_valid_mac = mac_addr
-                    except Exception:
-                        pass
+                    # IPv6 文本也可能恰有六段，只接受链路层地址作为设备身份。
+                    if addr.family != getattr(psutil, "AF_LINK", None):
+                        continue
+                    address = str(addr.address).replace("-", ":").lower()
+                    parts = address.split(":")
+                    if (
+                        len(parts) == 6
+                        and all(
+                            len(part) == 2 and all(char in "0123456789abcdef" for char in part)
+                            for part in parts
+                        )
+                        and address != "00:00:00:00:00:00"
+                    ):
+                        mac_addr = address
+                        if first_valid_mac is None:
+                            first_valid_mac = mac_addr
                 if has_ip and mac_addr:
                     target_mac = mac_addr
                     break
@@ -322,11 +341,16 @@ class StudentClient:
         logger.info(f"Student client started: {self.hostname} ({self.local_ip})")
 
     def stop(self):
+        self._stopping.set()
+        self._command_queue.put(None)
+        if self._command_worker:
+            self._command_worker.join(timeout=20.0)
         self._stop_screen_monitor()
         self.command_runtime.stop()
         self.blacklist_enforcer.stop()
         self.heartbeat_sender.stop()
         self.tcp_client.disconnect()
+        self.file_receiver.close()
         self.discover_listener.stop()
         self._restore_temporary_controls()
         self.state_store.close()
@@ -354,6 +378,7 @@ class StudentClient:
 
     def _on_disconnected(self):
         logger.info("Disconnected from teacher")
+        self.file_receiver.close()
         self._restore_temporary_controls()
         if self.on_disconnected:
             self.on_disconnected()
@@ -436,20 +461,23 @@ class StudentClient:
                 self._handle_update_check(params)
             elif msg_type == MessageType.TEACHER_HEARTBEAT:
                 self.command_runtime.heartbeat()
+                if self.recovery_guard is not None:
+                    self.recovery_guard.renew(bool(self.temporary_lease.active_controls()))
+                if self.input_blocker is not None:
+                    self.input_blocker.renew()
         except Exception as e:
             logger.error(f"Handle message error: {e}")
 
     def _handle_black_screen(self, params: dict):
         enable = params.get("enable", False)
+        self._set_input_lock("silence", bool(enable))
         with self._state_lock:
             self._black_screen = enable
             self._black_screen_message = str(params.get("message") or "") if enable else ""
         if enable:
             if self.on_black_screen_changed:
-                self.on_black_screen_changed(enable)
-            self._set_input_lock("silence", True)
+                self.on_black_screen_changed(enable and not self._remote_active)
         else:
-            self._set_input_lock("silence", False)
             if self.on_black_screen_changed:
                 self.on_black_screen_changed(enable)
         logger.info(f"Black screen: {enable}")
@@ -597,7 +625,7 @@ class StudentClient:
                 except Exception as e:
                     logger.debug(f"Decode frame data error: {e}")
 
-    def _handle_net_control(self, params: dict):
+    def _handle_net_control(self, params: dict) -> bool:
         enable = params.get("enable", False)
         allowed = list(params.get("allowed_cidrs") or params.get("whitelist") or [])
         teacher_ip = self.tcp_client.server_host
@@ -614,21 +642,24 @@ class StudentClient:
             "net_blocked": self._net_blocked,
         })
         logger.info(f"Net control applied: enable={enable}, success={success}")
+        return bool(success)
 
-    def _set_input_lock(self, reason: str, enabled: bool) -> None:
+    def _set_input_lock(self, reason: str, enabled: bool) -> bool:
         with self._state_lock:
-            was_locked = bool(self._input_lock_reasons)
+            reasons = set(self._input_lock_reasons)
             if enabled:
-                self._input_lock_reasons.add(reason)
+                reasons.add(reason)
             else:
-                self._input_lock_reasons.discard(reason)
-            is_locked = bool(self._input_lock_reasons)
-        if is_locked and not was_locked:
+                reasons.discard(reason)
             if self.input_blocker is not None:
-                threading.Thread(target=self.input_blocker.block, daemon=True).start()
-        elif was_locked and not is_locked:
-            if self.input_blocker is not None:
-                threading.Thread(target=self.input_blocker.unblock, daemon=True).start()
+                locked = bool(reasons) and not self._remote_active
+                success = (
+                    self.input_blocker.block() if locked else self.input_blocker.unblock()
+                )
+                if not success:
+                    raise RuntimeError("键鼠限制执行失败")
+            self._input_lock_reasons = reasons
+        return True
 
     def _setup_v2_handlers(self) -> None:
         handlers = {
@@ -670,12 +701,24 @@ class StudentClient:
         if envelope.action == CommandKind.REMOTE_INPUT.value:
             self._execute_v2_command(envelope)
             return
-        threading.Thread(
-            target=self._execute_v2_command,
-            args=(envelope,),
-            name="student-v2-command",
-            daemon=True,
-        ).start()
+        # 同一设备按 TCP 收到的顺序执行，快速点击黑屏/解除不会被线程调度倒置。
+        with self._command_worker_lock:
+            if self._command_worker is None:
+                self._command_worker = threading.Thread(
+                    target=self._run_commands, name="student-v2-command", daemon=True
+                )
+                self._command_worker.start()
+        self._command_queue.put(envelope)
+
+    def _run_commands(self) -> None:
+        while True:
+            envelope = self._command_queue.get()
+            if envelope is None or self._stopping.is_set():
+                return
+            try:
+                self._execute_v2_command(envelope)
+            except Exception as exc:
+                logger.error(f"Command execution failed: {exc}")
 
     def _execute_v2_command(self, envelope: ControlEnvelope) -> None:
         payload = dict(envelope.payload)
@@ -717,6 +760,8 @@ class StudentClient:
         restore: Callable[[], object],
     ) -> None:
         self.command_runtime.mark_temporary_control(kind, restore)
+        if self.recovery_guard is not None:
+            self.recovery_guard.renew(True)
 
     def _v2_broadcast_start(self, params: Mapping[str, object]):
         delegated = self._session_action(CommandKind.BROADCAST_START.value, params)
@@ -789,18 +834,21 @@ class StudentClient:
         return {"silence": False}
 
     def _v2_network_block(self, params: Mapping[str, object]):
-        self._handle_net_control({"enable": True, **dict(params)})
-        if not self._net_blocked:
-            return CommandHandlerResult.failed("failed to block external network")
         self._activate_lease(
             TemporaryControlKind.INTERNET_BLOCK,
             lambda: self._handle_net_control({"enable": False}),
         )
+        success = self._handle_net_control({**dict(params), "enable": True})
+        if not self._net_blocked:
+            self.temporary_lease.deactivate(TemporaryControlKind.INTERNET_BLOCK)
+        if not success:
+            return CommandHandlerResult.failed(
+                self.net_controller.last_error or "failed to block external network"
+            )
         return {"network_blocked": True}
 
     def _v2_network_restore(self, params: Mapping[str, object]):
-        self._handle_net_control({"enable": False})
-        if self._net_blocked:
+        if not self._handle_net_control({"enable": False}):
             return CommandHandlerResult.failed("failed to restore network")
         self.temporary_lease.deactivate(TemporaryControlKind.INTERNET_BLOCK)
         return {"network_blocked": False}
@@ -864,7 +912,8 @@ class StudentClient:
             stream_id = device_session_id(
                 base_session_id, str(params.get("device_id") or self.student_id)
             )
-            self._inspection_sender = UdpMjpegSender(
+            use_tcp = str(params.get("transport") or "tcp") != "udp"
+            self._inspection_sender = None if use_tcp else UdpMjpegSender(
                 str(self.tcp_client.server_host or "127.0.0.1"),
                 int(params.get("port") or self.config.get("student.inspection_port", 9530)),
                 stream_id,
@@ -873,8 +922,9 @@ class StudentClient:
                 str(self.tcp_client.server_host or "127.0.0.1"),
                 int(params.get("fallback_port") or self.config.get("student.bulk_port", 9531)),
                 stream_id,
-            )
-            self._inspection_tcp_sender.start()
+            ) if use_tcp else None
+            if self._inspection_tcp_sender:
+                self._inspection_tcp_sender.start()
         except Exception as exc:
             self._inspection_sender = None
             self._inspection_tcp_sender = None
@@ -913,67 +963,80 @@ class StudentClient:
         return {"inspection": False}
 
     def _v2_remote_start(self, params: Mapping[str, object]):
+        if self._remote_active:
+            return {"remote_control": True, "backend": "ultravnc",
+                    "port": self.vnc_server.port}
         delegated = self._session_action(CommandKind.REMOTE_CONTROL_START.value, params)
         if delegated is not None:
             if delegated.status != OutcomeStatus.SUCCEEDED:
                 return delegated
-            self._inspection_mode = "remote_control"
+        self._remote_active = True
+        self._activate_lease(TemporaryControlKind.REMOTE_CONTROL, self._stop_remote_control)
+        try:
+            self._close_inspection()
+            self.temporary_lease.deactivate(TemporaryControlKind.INSPECTION)
             self._forget_session_actions("inspection")
-            self._remember_session_action(
-                "remote_control", CommandKind.REMOTE_CONTROL_START.value, params
-            )
-            self._activate_lease(
-                TemporaryControlKind.REMOTE_CONTROL,
-                lambda: self._restore_tracked_session_action(
-                    CommandKind.REMOTE_CONTROL_STOP.value,
-                    ("remote_control", "inspection"),
-                ),
-            )
-            return delegated
-        inspection = self._v2_inspection_open({**dict(params), "mode": "remote_control"})
-        if isinstance(inspection, CommandHandlerResult):
-            return inspection
-        self._set_input_lock("remote_control", True)
+            if delegated is None:
+                self._set_input_lock("remote_control", False)
+                if self.on_black_screen_changed:
+                    self.on_black_screen_changed(False)
+            ready = self.vnc_server.start()
+        except Exception as exc:
+            if self._stop_remote_control():
+                self.temporary_lease.deactivate(TemporaryControlKind.REMOTE_CONTROL)
+            return CommandHandlerResult.failed(str(exc))
+        self._remember_session_action(
+            "remote_control", CommandKind.REMOTE_CONTROL_START.value, params
+        )
         self._activate_lease(
             TemporaryControlKind.REMOTE_CONTROL,
             self._stop_remote_control,
         )
-        return {"remote_control": True}
+        return {"remote_control": True, **ready}
 
     def _stop_remote_control(self):
-        self._set_input_lock("remote_control", False)
-        self._close_inspection()
+        if not self._remote_active:
+            return True
+        try:
+            self.vnc_server.stop()
+        except Exception as exc:
+            logger.error(f"Cannot stop UltraVNC: {exc}")
+            return False
+        delegated = self._session_action(CommandKind.REMOTE_CONTROL_STOP.value, {})
+        if delegated is not None and delegated.status != OutcomeStatus.SUCCEEDED:
+            return False
+        self._remote_active = False
+        if delegated is None:
+            self._set_input_lock("remote_control", False)
+            if self.on_black_screen_changed:
+                self.on_black_screen_changed(self._black_screen)
+        self._forget_session_actions("remote_control")
         return True
 
     def _v2_remote_stop(self, params: Mapping[str, object]):
-        delegated = self._session_action(CommandKind.REMOTE_CONTROL_STOP.value, params)
-        if delegated is not None:
-            if delegated.status == OutcomeStatus.SUCCEEDED:
-                self._inspection_mode = None
-                self._forget_session_actions("remote_control", "inspection")
-                self.temporary_lease.deactivate(TemporaryControlKind.REMOTE_CONTROL)
-                self.temporary_lease.deactivate(TemporaryControlKind.INSPECTION)
-            return delegated
-        self._stop_remote_control()
+        if not self._stop_remote_control():
+            return CommandHandlerResult.failed("远控退出恢复失败，稍后自动重试")
         self.temporary_lease.deactivate(TemporaryControlKind.REMOTE_CONTROL)
-        self.temporary_lease.deactivate(TemporaryControlKind.INSPECTION)
         return {"remote_control": False}
 
     def _v2_restore_all(self, params: Mapping[str, object]):
-        self._restore_temporary_controls()
+        if not self._restore_temporary_controls():
+            return CommandHandlerResult.failed("部分临时控制未能恢复，正在重试")
         return {"restored": True, "blacklist_preserved": True}
 
     def _restore_temporary_controls(self) -> bool:
-        self.temporary_lease.restore_all()
-        self._clear_session_replay()
+        results = self.temporary_lease.restore_all()
+        success = all(result.success for result in results)
+        if success:
+            self._clear_session_replay()
         self._handle_broadcast_stop({})
         self._handle_black_screen({"enable": False})
         self._set_input_lock("input", False)
         self._set_input_lock("remote_control", False)
         self._close_inspection()
         if self.net_controller.is_blocked():
-            self._handle_net_control({"enable": False})
-        return True
+            success = self._handle_net_control({"enable": False}) and success
+        return success
 
     def _v2_process_list(self, params: Mapping[str, object]):
         processes = [
@@ -1007,6 +1070,8 @@ class StudentClient:
         return CommandHandlerResult.failed(result.message, payload)
 
     def _v2_remote_input(self, params: Mapping[str, object]):
+        if self._remote_active:
+            return CommandHandlerResult.failed("远控输入由 UltraVNC 负责")
         if TemporaryControlKind.REMOTE_CONTROL not in self.temporary_lease.active_controls():
             return CommandHandlerResult.failed("remote control lease is not active")
         delegated = self._session_action(CommandKind.REMOTE_INPUT.value, params)
@@ -1019,9 +1084,29 @@ class StudentClient:
     def _v2_blacklist_set(self, params: Mapping[str, object]):
         program = str(params.get("program") or params.get("name") or "")
         path = str(params.get("path") or "") or None
+        if normalize_executable_name(program) in {
+            normalize_executable_name(name) for name in DEFAULT_PROTECTED_PROCESS_NAMES
+        }:
+            return CommandHandlerResult.failed("系统和课堂关键程序不能加入禁用列表")
         rule = self.state_store.add_blacklist_rule(program, path)
-        self.blacklist_enforcer.enforce_once()
-        return {"rule_id": rule.rule_id, "program": rule.executable_name, "path": rule.full_path}
+        results = self.blacklist_enforcer.enforce_once()
+        failures = [
+            {"pid": item.process.pid, "status": item.termination.status.value,
+             "detail": item.termination.message}
+            for item in results
+            if item.rule.rule_id == rule.rule_id
+            and item.termination.status not in {
+                ProcessTerminationStatus.TERMINATED, ProcessTerminationStatus.NOT_FOUND,
+            }
+        ]
+        payload = {
+            "rule_id": rule.rule_id, "program": rule.executable_name,
+            "path": rule.full_path, "policy_saved": True,
+            "enforcement": "terminate_after_launch", "failures": failures,
+        }
+        if failures:
+            return CommandHandlerResult.failed("策略已保存，但部分进程未能关闭", payload)
+        return payload
 
     def _v2_blacklist_clear(self, params: Mapping[str, object]):
         rule_id = params.get("rule_id")
@@ -1029,12 +1114,16 @@ class StudentClient:
         if rule_id is not None:
             removed = self.state_store.remove_blacklist_rule(int(rule_id))
         else:
-            program = str(params.get("program") or params.get("name") or "").casefold()
-            path = str(params.get("path") or "").casefold()
+            program = normalize_executable_name(
+                str(params.get("program") or params.get("name") or "")
+            )
+            path = normalize_windows_path(str(params["path"])) if params.get("path") else ""
             for rule in self.state_store.list_blacklist_rules():
-                if rule.executable_name.casefold() != program:
+                if normalize_executable_name(rule.executable_name) != program:
                     continue
-                if path and (rule.full_path or "").casefold() != path:
+                if path and (
+                    not rule.full_path or normalize_windows_path(rule.full_path) != path
+                ):
                     continue
                 removed = self.state_store.remove_blacklist_rule(rule.rule_id) or removed
         return {"removed": removed}
@@ -1074,7 +1163,15 @@ class StudentClient:
         if self.service_mode:
             file_params["target_dir_type"] = TARGET_DIR_DEFAULT
             file_params["target_dir_path"] = ""
-        resume = self.file_receiver.handle_start(file_params)
+        try:
+            resume = self.file_receiver.handle_start(file_params)
+        except Exception as exc:
+            self.tcp_client.send_message(build_message(MessageType.FILE_SEND_ACK, {
+                "student_id": self.student_id,
+                "transfer_id": params.get("transfer_id", ""),
+                "stage": "start", "success": False, "result": str(exc),
+            }))
+            return
         self.tcp_client.send_message(build_message(MessageType.FILE_SEND_ACK, {
             "student_id": self.student_id,
             "transfer_id": params.get("transfer_id", ""),
@@ -1103,7 +1200,10 @@ class StudentClient:
                 self.update_client._active_transfer.get("transfer_id") == params.get("transfer_id", ""):
             self.update_client.handle_end(params)
             return
-        success, result = self.file_receiver.handle_end(params)
+        try:
+            success, result = self.file_receiver.handle_end(params)
+        except Exception as exc:
+            success, result = False, str(exc)
         if success and self.on_file_received:
             self.on_file_received(result)
         ack_msg = build_message(MessageType.FILE_SEND_ACK, {

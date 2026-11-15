@@ -78,6 +78,12 @@ def test_launch_uses_active_user_token_and_closes_all_handles(monkeypatch, tmp_p
         assert session_launcher.launch_installed_agent(str(service_path)) is True
 
     agent_path = session_launcher.installed_agent_path(str(service_path))
+    modules["win32security"].DuplicateTokenEx.assert_called_once_with(
+        ExistingToken=token,
+        ImpersonationLevel=modules["win32security"].SecurityImpersonation,
+        DesiredAccess=modules["win32con"].MAXIMUM_ALLOWED,
+        TokenType=modules["win32security"].TokenPrimary,
+    )
     call = modules["win32process"].CreateProcessAsUser.call_args.args
     assert call[0] is primary
     assert call[1] == agent_path

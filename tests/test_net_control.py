@@ -1,130 +1,132 @@
+import ipaddress
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import pytest
-import sys
-from unittest.mock import patch, MagicMock
+
 from student.core.net_control import NetController, RULE_NAME_PREFIX
 
 
-class TestNetController:
-    def test_initial_state(self):
-        controller = NetController()
-        assert controller.is_blocked() is False
+class FakeRules:
+    def __init__(self):
+        self.values = {}
+        self.fail_add = False
+        self.fail_remove = False
 
-    def test_block_unblock_windows(self, tmp_path):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            controller._state_file = str(tmp_path / "net_state.json")
-            with patch.object(controller, '_check_admin', return_value=True), \
-                 patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                result = controller.block_internet()
-                assert result is True
-                assert controller.is_blocked() is True
-                assert mock_run.call_count >= 1
+    def __iter__(self):
+        return iter(list(self.values.values()))
 
-                mock_run.reset_mock()
+    def Add(self, rule):
+        if self.fail_add:
+            raise RuntimeError("rule rejected")
+        self.values[rule.Name] = rule
 
-                result = controller.unblock_internet()
-                assert result is True
-                assert controller.is_blocked() is False
+    def Item(self, name):
+        return self.values[name]
 
-    def test_block_with_whitelist(self, tmp_path):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            controller._state_file = str(tmp_path / "net_state.json")
-            with patch.object(controller, '_check_admin', return_value=True), \
-                 patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                whitelist = ["192.168.1.1", "10.0.0.1"]
-                result = controller.block_internet(whitelist)
-                assert result is True
-                assert controller.is_blocked() is True
-                assert controller._whitelist_ips == whitelist
-                commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
-                assert any("remoteip=192.168.1.1" in cmd for cmd in commands)
-                assert any("remoteip=192.168.0.0/16" in cmd and "action=allow" in cmd for cmd in commands)
-                assert any(f"{RULE_NAME_PREFIX}_BlockExternal_" in cmd and "action=block" in cmd for cmd in commands)
-                assert not any("firewallpolicy blockinbound,blockoutbound" in cmd for cmd in commands)
+    def Remove(self, name):
+        if self.fail_remove:
+            raise RuntimeError("access denied")
+        self.values.pop(name, None)
 
-    def test_block_does_not_override_lan_allow_with_program_rules(self, tmp_path):
-        chrome_path = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
-        chrome_path.parent.mkdir(parents=True)
-        chrome_path.write_text("")
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            controller._state_file = str(tmp_path / "net_state.json")
-            with patch.object(controller, '_check_admin', return_value=True), \
-                 patch.dict('os.environ', {"ProgramFiles": str(tmp_path), "ProgramFiles(x86)": "", "LocalAppData": ""}), \
-                 patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
-                assert controller.block_internet() is True
+@pytest.fixture
+def firewall(monkeypatch, tmp_path):
+    policy = SimpleNamespace(
+        LocalPolicyModifyState=0, Rules=FakeRules(), _oleobj_=MagicMock()
+    )
+    policy._oleobj_.Invoke.return_value = True
 
-                commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
-                assert not any(f"program={chrome_path}" in cmd for cmd in commands)
-                assert any("remoteip=10.0.0.0/8" in cmd and "action=allow" in cmd for cmd in commands)
+    @contextmanager
+    def fake_policy():
+        yield policy, lambda _name: SimpleNamespace()
 
-    def test_block_idempotent(self, tmp_path):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            controller._state_file = str(tmp_path / "net_state.json")
-            with patch.object(controller, '_check_admin', return_value=True), \
-                 patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                controller.block_internet()
-                first_count = mock_run.call_count
-                controller.block_internet()
-                assert mock_run.call_count == first_count
+    monkeypatch.setattr(NetController, "_windows_policy", staticmethod(fake_policy))
+    monkeypatch.setattr(NetController, "_check_admin", lambda _self: True)
+    controller = NetController()
+    controller._state_file = str(tmp_path / "net_state.json")
+    return controller, policy
 
-    def test_unblock_idempotent(self):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                controller.unblock_internet()
-                assert mock_run.call_count >= 1
 
-    def test_partial_windows_block_failure_cleans_created_rules(self):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            with patch.object(controller, '_check_admin', return_value=True), \
-                 patch.object(controller, '_cleanup_windows_rules', return_value=True) as cleanup, \
-                 patch.object(controller, '_run_cmd', return_value=False):
-                assert controller.block_internet() is False
+def test_block_ipv4_ipv6_keeps_only_teacher_and_explicit_allowed_networks(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert controller.block_internet(["192.168.1.2", "2001:db8::2"])
+    networks = [
+        ipaddress.ip_network(value)
+        for rule in policy.Rules
+        for value in rule.RemoteAddresses.split(",")
+    ]
+    for address, blocked in (
+        ("8.8.8.8", True), ("2606:4700:4700::1111", True),
+        ("192.168.1.2", False), ("2001:db8::2", False),
+        ("192.168.1.3", True), ("10.0.0.1", True), ("127.0.0.1", False),
+    ):
+        assert any(ipaddress.ip_address(address) in network for network in networks) == blocked
+    assert all(rule.Protocol == 256 and rule.Direction == 2 and rule.Action == 0
+               for rule in policy.Rules)
+    assert controller.is_blocked()
 
-        assert cleanup.call_count == 2
-        assert controller.is_blocked() is False
 
-    def test_unblock_cleans_rules(self, tmp_path):
-        with patch('sys.platform', 'win32'):
-            controller = NetController()
-            controller._state_file = str(tmp_path / "net_state.json")
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(
-                    returncode=0,
-                    stdout=f"规则名称: {RULE_NAME_PREFIX}_BlockHTTP\n",
-                    stderr=""
-                )
-                controller._blocked = True
-                result = controller.unblock_internet()
-                assert result is True
-                assert controller.is_blocked() is False
+def test_disabled_firewall_and_domain_policy_report_failure(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        policy._oleobj_.Invoke.return_value = False
+        assert not controller.block_internet(["192.168.1.2"])
+        assert "防火墙" in controller.last_error
+        policy._oleobj_.Invoke.return_value = True
+        policy.LocalPolicyModifyState = 1
+        assert not controller.block_internet(["192.168.1.2"])
+        assert "域策略" in controller.last_error
+    assert not controller.is_blocked()
 
-    def test_linux_block(self):
-        with patch('sys.platform', 'linux'):
-            controller = NetController()
-            with patch('os.geteuid', return_value=0, create=True), \
-                 patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                result = controller.block_internet()
-                assert result is True
-                assert controller.is_blocked() is True
 
-    def test_linux_unblock(self):
-        with patch('sys.platform', 'linux'):
-            controller = NetController()
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                controller._blocked = True
-                result = controller.unblock_internet()
-                assert result is True
-                assert controller.is_blocked() is False
+def test_failed_rule_install_rolls_back(firewall):
+    controller, policy = firewall
+    policy.Rules.fail_add = True
+    with patch("sys.platform", "win32"):
+        assert not controller.block_internet(["192.168.1.2"])
+    assert not list(policy.Rules)
+    assert not controller.is_blocked()
+
+
+def test_failed_restore_keeps_blocked_state_until_retry(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert controller.block_internet(["192.168.1.2"])
+        policy.Rules.fail_remove = True
+        assert not controller.unblock_internet()
+        assert controller.is_blocked()
+        policy.Rules.fail_remove = False
+        assert controller.unblock_internet()
+    assert not controller.is_blocked()
+
+
+def test_restore_removes_legacy_rules_without_touching_other_rules(firewall):
+    controller, policy = firewall
+    policy.Rules.Add(SimpleNamespace(Name=RULE_NAME_PREFIX + "_Old", Grouping=""))
+    policy.Rules.Add(SimpleNamespace(Name="OtherProduct", Grouping=""))
+    with patch("sys.platform", "win32"):
+        assert controller.restore_stale_rules()
+    assert set(policy.Rules.values) == {"OtherProduct"}
+
+
+def test_repeated_block_and_changed_teacher_whitelist(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert controller.block_internet(["192.168.1.2"])
+        previous = list(policy.Rules)
+        assert controller.block_internet(["192.168.1.2"])
+        assert list(policy.Rules) == previous
+        assert controller.block_internet(["192.168.1.3"])
+        assert list(policy.Rules) != previous
+
+
+def test_linux_unblock_success_when_commands_accept():
+    controller = NetController()
+    controller._blocked = True
+    with patch("sys.platform", "linux"), patch.object(
+        controller, "_run_cmd", return_value=True
+    ):
+        assert controller.unblock_internet()

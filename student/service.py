@@ -10,6 +10,7 @@ from student.core.student_client import StudentClient
 from student.core.v2.ipc import STUDENT_PIPE_NAME, WindowsNamedPipeListener
 from student.core.v2.runtime import SessionAgentProxy
 from student.core.v2.session_launcher import launch_installed_agent
+from student.core.v2.recovery_watchdog import RecoveryWatchdog, watch
 
 logger = get_logger("student_service")
 
@@ -49,6 +50,9 @@ if win32serviceutil is not None:
         def SvcDoRun(self):
             servicemanager.LogInfoMsg("LanClassroom student service starting")
             self._client = StudentClient(service_mode=True)
+            guard = RecoveryWatchdog()
+            guard.start()
+            self._client.recovery_guard = guard
             self._client.start()
             self._pipe_thread = threading.Thread(target=self._pipe_loop, daemon=True)
             self._pipe_thread.start()
@@ -65,9 +69,15 @@ if win32serviceutil is not None:
                     launch_installed_agent()
                     channel = self._listener.accept()
                     proxy = SessionAgentProxy(channel)
+                    ready = proxy.call("ping", timeout=2.0)
+                    if not ready.success:
+                        raise RuntimeError(ready.error or "desktop agent is not ready")
+                    if ready.payload.get("pid"):
+                        self._client.recovery_guard.attach_agent(int(ready.payload["pid"]))
                     self._client.attach_session_agent(proxy)
                     while not self._stop_event.wait(3.0):
                         if not proxy.call("ping", timeout=2.0).success:
+                            self._client.recovery_guard.reset_agent()
                             break
                 except Exception as exc:
                     if not self._stop_event.is_set():
@@ -82,6 +92,13 @@ if win32serviceutil is not None:
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--diagnostics":
+        from common.diagnostics import startup_probe
+        startup_probe("service", sys.argv[2])
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--recovery-watchdog":
+        watch(sys.argv[2])
+        return
     if win32serviceutil is None:
         raise RuntimeError("pywin32 is required to run the Windows service")
     if len(sys.argv) == 1:

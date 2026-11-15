@@ -50,6 +50,8 @@ class TeacherServer:
         self._v2_identity_resolver: Optional[Callable[[str, str], tuple]] = None
         self._teacher_heartbeat_stop = threading.Event()
         self._teacher_heartbeat_thread = None
+        self._heartbeat_pending = set()
+        self._heartbeat_pending_lock = threading.Lock()
 
         self._setup_callbacks()
 
@@ -104,11 +106,30 @@ class TeacherServer:
         interval = max(1.0, float(self.config.get("teacher.heartbeat_interval", 3)))
         lease_seconds = float(self.config.get("teacher.control_lease_seconds", 10))
         while not self._teacher_heartbeat_stop.is_set():
-            self.tcp_server.broadcast_message(build_message(
+            message = build_message(
                 MessageType.TEACHER_HEARTBEAT,
                 {"timestamp": time.time(), "lease_seconds": lease_seconds},
-            ))
+            )
+            self._send_teacher_heartbeat(message)
             self._teacher_heartbeat_stop.wait(interval)
+
+    def _send_teacher_heartbeat(self, message: dict) -> None:
+        for connection in self.tcp_server.get_all_connections():
+            with self._heartbeat_pending_lock:
+                if connection in self._heartbeat_pending:
+                    continue
+                self._heartbeat_pending.add(connection)
+            threading.Thread(
+                target=self._send_one_heartbeat, args=(connection, message),
+                name="teacher-device-heartbeat", daemon=True,
+            ).start()
+
+    def _send_one_heartbeat(self, connection, message: dict) -> None:
+        try:
+            connection.send_message(message)
+        finally:
+            with self._heartbeat_pending_lock:
+                self._heartbeat_pending.discard(connection)
 
     def _on_connect(self, conn: TCPConnection):
         pass

@@ -1,8 +1,10 @@
 import os
+import socket
 import sys
 import tempfile
 import time
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 from common.v2.control import AckStage, ControlEnvelope
 from common.v2.model import CommandKind
@@ -29,6 +31,20 @@ def client_with_memory_state(service_mode=False):
             state_store=StudentStateStore(":memory:"),
             service_mode=service_mode,
         )
+
+
+def test_mac_identity_does_not_get_overwritten_by_ipv6_address():
+    import psutil
+
+    client = object.__new__(StudentClient)
+    client.local_ip = "10.0.2.15"
+    addresses = [
+        SimpleNamespace(family=psutil.AF_LINK, address="08-00-27-12-34-56"),
+        SimpleNamespace(family=socket.AF_INET, address=client.local_ip),
+        SimpleNamespace(family=socket.AF_INET6, address="fe80::e133:29d6:e94b:279e"),
+    ]
+    with patch("psutil.net_if_addrs", return_value={"Ethernet": addresses}):
+        assert client._get_mac().replace("-", ":").lower() == "08:00:27:12:34:56"
 
 
 def test_service_mode_file_delivery_uses_public_desktop():

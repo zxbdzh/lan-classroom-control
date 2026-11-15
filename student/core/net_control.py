@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from typing import List, Optional
 from common.logger import get_logger
 
@@ -36,16 +37,24 @@ class NetController:
     def __init__(self):
         self._blocked = False
         self._lock = threading.Lock()
+        self._policy_lock = threading.RLock()
         self._whitelist_ips: List[str] = []
+        self.last_error = ""
         self._state_file = os.path.join(
             os.path.expanduser("~"), ".lan_classroom", "net_control_state.json"
         )
 
     def block_internet(self, whitelist_ips: Optional[List[str]] = None) -> bool:
+        with self._policy_lock:
+            return self._block_internet(whitelist_ips)
+
+    def _block_internet(self, whitelist_ips: Optional[List[str]] = None) -> bool:
         with self._lock:
-            if self._blocked:
+            requested = list(whitelist_ips or [])
+            if self._blocked and requested == self._whitelist_ips:
                 return True
-            self._whitelist_ips = whitelist_ips or []
+            self._whitelist_ips = requested
+        self.last_error = ""
         if sys.platform == "win32":
             result = self._block_windows()
         else:
@@ -59,6 +68,10 @@ class NetController:
         return result
 
     def unblock_internet(self) -> bool:
+        with self._policy_lock:
+            return self._unblock_internet()
+
+    def _unblock_internet(self) -> bool:
         with self._lock:
             was_blocked = self._blocked
         if sys.platform == "win32":
@@ -108,45 +121,82 @@ class NetController:
 
     def _block_windows(self) -> bool:
         if not self._check_admin():
-            logger.error("Cannot block internet: no administrator privilege")
+            self.last_error = "禁网需要学生端系统服务或管理员权限"
+            return False
+        try:
+            with self._windows_policy() as (policy, dispatch):
+                if int(policy.LocalPolicyModifyState) != 0:
+                    raise RuntimeError("域策略禁止本地防火墙规则生效")
+                for profile in (1, 2, 4):
+                    enabled = policy._oleobj_.Invoke(
+                        policy._oleobj_.GetIDsOfNames("FirewallEnabled"),
+                        0, 2, True, profile,
+                    )
+                    if not enabled:
+                        raise RuntimeError("请先启用 Windows 防火墙的全部网络配置")
+                self._remove_policy_rules(policy)
+                allowed = self._allowed_networks(self._whitelist_ips)
+                ranges = self._external_networks(allowed)
+                # 阻断规则优先于允许规则，因此只阻断白名单的补集，保留教师连接。
+                for version in (4, 6):
+                    networks = [
+                        value for value in ranges
+                        if ipaddress.ip_network(value).version == version
+                    ]
+                    for index, remote_ips in enumerate(self._chunk_remote_ips(networks)):
+                        rule = dispatch("HNetCfg.FWRule")
+                        rule.Name = f"{RULE_NAME_PREFIX}_BlockExternal_{version}_{index}"
+                        rule.Description = "课堂禁网；解除课堂控制时自动移除"
+                        rule.Grouping = RULE_GROUP
+                        rule.Protocol = 256
+                        rule.Direction = 2
+                        rule.Action = 0
+                        rule.Profiles = 0x7FFFFFFF
+                        rule.RemoteAddresses = remote_ips
+                        rule.Enabled = True
+                        policy.Rules.Add(rule)
+                        saved = policy.Rules.Item(rule.Name)
+                        if not saved.Enabled or int(saved.Action) != 0:
+                            raise RuntimeError("防火墙未保存阻断规则")
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.error(f"Cannot apply network policy: {exc}")
+            if not self._cleanup_windows_rules():
+                # 清理失败时仍视为有残留，租约恢复必须继续重试。
+                with self._lock:
+                    self._blocked = True
+            else:
+                with self._lock:
+                    self._blocked = False
             return False
 
-        if not self._cleanup_windows_rules():
-            logger.error("Cannot apply network policy: stale classroom rules remain")
-            return False
-        allowed = self._allowed_networks(self._whitelist_ips)
-        for idx, network in enumerate(allowed):
-            for direction in ("out", "in"):
-                if not self._run_cmd([
-                    "netsh", "advfirewall", "firewall", "add", "rule",
-                    f"name={RULE_NAME_PREFIX}_Allow_{direction}_{idx}",
-                    f"dir={direction}",
-                    "action=allow",
-                    "protocol=any",
-                    f"remoteip={network}",
-                    f"group={RULE_GROUP}",
-                    "enable=yes",
-                    "profile=any",
-                ]):
-                    self._cleanup_windows_rules()
-                    return False
+    @staticmethod
+    @contextmanager
+    def _windows_policy():
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        try:
+            yield win32com.client.Dispatch("HNetCfg.FwPolicy2"), win32com.client.Dispatch
+        finally:
+            pythoncom.CoUninitialize()
 
-        external_ranges = self._external_networks(allowed)
-        for idx, remote_ip in enumerate(self._chunk_remote_ips(external_ranges)):
-            if not self._run_cmd([
-                "netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={RULE_NAME_PREFIX}_BlockExternal_{idx}",
-                "dir=out",
-                "action=block",
-                "protocol=any",
-                f"remoteip={remote_ip}",
-                f"group={RULE_GROUP}",
-                "enable=yes",
-                "profile=any",
-            ]):
-                self._cleanup_windows_rules()
-                return False
-        return True
+    @staticmethod
+    def _remove_policy_rules(policy) -> None:
+        names = [
+            str(rule.Name) for rule in policy.Rules
+            if str(rule.Name).startswith(RULE_NAME_PREFIX)
+            or str(rule.Grouping) == RULE_GROUP
+        ]
+        for name in names:
+            policy.Rules.Remove(name)
+        if any(
+            str(rule.Name).startswith(RULE_NAME_PREFIX)
+            or str(rule.Grouping) == RULE_GROUP
+            for rule in policy.Rules
+        ):
+            raise RuntimeError("课堂防火墙规则清理失败")
 
     def _unblock_windows(self) -> bool:
         if not self._check_admin():
@@ -167,14 +217,10 @@ class NetController:
     def _allowed_networks(self, values: List[str]) -> List[str]:
         defaults = [
             "127.0.0.0/8",
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
             "169.254.0.0/16",
             "224.0.0.0/4",
             "255.255.255.255/32",
             "::1/128",
-            "fc00::/7",
             "fe80::/10",
             "ff00::/8",
         ]
@@ -233,54 +279,24 @@ class NetController:
         return chunks
 
     def _cleanup_windows_rules(self) -> bool:
-        self._run_cmd([
-            "netsh", "advfirewall", "firewall", "delete", "rule",
-            "name=all", f"group={RULE_GROUP}",
-        ], log_failure=False)
-        known_rules = {
-            f"{RULE_NAME_PREFIX}_BlockAllTCP",
-            f"{RULE_NAME_PREFIX}_BlockDNS",
-            f"{RULE_NAME_PREFIX}_BlockWebTCP",
-            f"{RULE_NAME_PREFIX}_BlockWebUDP",
-            f"{RULE_NAME_PREFIX}_BlockDnsUDP",
-            f"{RULE_NAME_PREFIX}_BlockDnsTCP",
-        }
-        enumerated_rules = set()
-        enumeration_ok = True
         try:
-            result = subprocess.run(
-                ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"],
-                capture_output=True, text=True, timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            enumeration_ok = result.returncode == 0
-            for line in result.stdout.splitlines():
-                index = line.find(RULE_NAME_PREFIX)
-                if index >= 0:
-                    name = line[index:].strip()
-                    known_rules.add(name)
-                    enumerated_rules.add(name)
+            with self._windows_policy() as (policy, _dispatch):
+                self._remove_policy_rules(policy)
+            return True
         except Exception as exc:
-            logger.debug(f"Cannot enumerate legacy firewall rules: {exc}")
-            enumeration_ok = False
-
-        success = enumeration_ok
-        for name in known_rules:
-            removed = self._run_cmd([
-                "netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"
-            ], log_failure=False)
-            if name in enumerated_rules and not removed:
-                success = False
-        return success
+            self.last_error = str(exc)
+            logger.error(f"Cannot remove classroom firewall rules: {exc}")
+            return False
 
     def restore_stale_rules(self) -> bool:
         if sys.platform != "win32" or not self._check_admin():
             return False
         restored = self._restore_windows_firewall_policy()
         cleaned = self._cleanup_windows_rules()
-        with self._lock:
-            self._blocked = False
-            self._whitelist_ips = []
+        if restored and cleaned:
+            with self._lock:
+                self._blocked = False
+                self._whitelist_ips = []
         return restored and cleaned
 
     def _add_windows_web_block_rules(self) -> bool:

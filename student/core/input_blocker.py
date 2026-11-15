@@ -1,6 +1,6 @@
 import sys
 import threading
-from typing import Optional
+import time
 from common.logger import get_logger
 
 logger = get_logger("input_blocker")
@@ -11,94 +11,106 @@ class InputBlocker:
         self._blocked = False
         self._keyboard_listener = None
         self._mouse_listener = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._release = threading.Event()
+        self._worker = None
+        self._backend = None
+        self._expires_at = 0.0
 
-    def block(self):
+    def block(self) -> bool:
         with self._lock:
+            self.renew()
             if self._blocked:
-                return
-            self._blocked = True
-        if sys.platform == "win32":
-            self._block_windows()
-        else:
-            self._block_pynput()
-        logger.info("Input blocked")
+                return True
+            if sys.platform == "win32" and self._block_windows():
+                self._backend = "windows"
+                self._blocked = True
+            else:
+                self._blocked = bool(self._block_pynput())
+                self._backend = "pynput" if self._blocked else None
+            if self._blocked:
+                logger.info("Input blocked")
+            else:
+                logger.error("Input blocking failed")
+            return self._blocked
 
-    def unblock(self):
+    def unblock(self) -> bool:
         with self._lock:
             if not self._blocked:
-                return
-            self._blocked = False
-        if sys.platform == "win32":
-            self._unblock_windows()
-        else:
+                return True
+            if self._backend == "windows":
+                self._release.set()
+                if self._worker:
+                    self._worker.join(timeout=2.0)
+                    if self._worker.is_alive():
+                        return False
             self._unblock_pynput()
-        logger.info("Input unblocked")
+            self._blocked = False
+            self._backend = None
+            logger.info("Input unblocked")
+            return True
 
     def is_blocked(self) -> bool:
         with self._lock:
             return self._blocked
 
-    def _block_windows(self):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            result = user32.BlockInput(True)
-            if not result:
-                logger.warning("Windows BlockInput returned false, falling back to pynput")
-                self._block_pynput()
-        except Exception as e:
-            logger.warning(f"Windows BlockInput failed: {e}, falling back to pynput")
-            self._block_pynput()
+    def renew(self) -> None:
+        self._expires_at = time.monotonic() + 15.0
 
-    def _unblock_windows(self):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            user32.BlockInput(False)
-        except Exception as e:
-            logger.warning(f"Windows UnblockInput failed: {e}")
-        finally:
-            # BlockInput may have fallen back to pynput even though the later
-            # Windows unblock call succeeds.
-            self._unblock_pynput()
+    def _block_windows(self) -> bool:
+        ready = threading.Event()
+        outcome = {"success": False}
+        self._release.clear()
 
-    def _block_pynput(self):
+        def hold_input() -> None:
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                outcome["success"] = bool(user32.BlockInput(True))
+                ready.set()
+                if outcome["success"]:
+                    try:
+                        # 即使 Qt 主线程卡死，锁定线程仍会独立到期释放本机键鼠。
+                        while not self._release.wait(0.25):
+                            if time.monotonic() >= self._expires_at:
+                                self._blocked = False
+                                break
+                    finally:
+                        # Windows 只允许锁定线程解除 BlockInput；线程退出也会解除锁定。
+                        user32.BlockInput(False)
+            except Exception as exc:
+                logger.warning(f"Windows BlockInput failed: {exc}")
+            finally:
+                ready.set()
+
+        self._worker = threading.Thread(
+            target=hold_input, name="student-input-lock", daemon=True
+        )
+        self._worker.start()
+        if not ready.wait(2.0):
+            self._release.set()
+            return False
+        return outcome["success"]
+
+    def _block_pynput(self) -> bool:
         try:
             from pynput import keyboard, mouse
 
-            def on_press(key):
-                return False
-
-            def on_release(key):
-                return False
-
-            def on_move(x, y):
-                return False
-
-            def on_click(x, y, button, pressed):
-                return False
-
-            def on_scroll(x, y, dx, dy):
-                return False
-
-            self._keyboard_listener = keyboard.Listener(
-                on_press=on_press,
-                on_release=on_release,
-                suppress=True
-            )
-            self._mouse_listener = mouse.Listener(
-                on_move=on_move,
-                on_click=on_click,
-                on_scroll=on_scroll,
-                suppress=True
-            )
+            # pynput 回调返回 False 会停止监听；suppress 本身负责持续拦截。
+            self._keyboard_listener = keyboard.Listener(suppress=True)
+            self._mouse_listener = mouse.Listener(suppress=True)
             self._keyboard_listener.start()
             self._mouse_listener.start()
+            self._keyboard_listener.wait()
+            self._mouse_listener.wait()
+            if self._keyboard_listener.is_alive() and self._mouse_listener.is_alive():
+                return True
         except ImportError:
             logger.warning("pynput not available, input blocking not functional")
         except Exception as e:
             logger.warning(f"pynput block failed: {e}")
+        self._unblock_pynput()
+        return False
 
     def _unblock_pynput(self):
         if self._keyboard_listener:

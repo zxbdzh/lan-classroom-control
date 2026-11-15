@@ -31,7 +31,6 @@ class PowerController:
     _COMMANDS = {
         PowerAction.SHUTDOWN: ["shutdown.exe", "/s", "/t", "0"],
         PowerAction.RESTART: ["shutdown.exe", "/r", "/t", "0"],
-        PowerAction.LOGOFF: ["shutdown.exe", "/l"],
     }
 
     def __init__(
@@ -39,10 +38,12 @@ class PowerController:
         allow_execution: bool = False,
         runner: Callable[..., Any] = subprocess.run,
         platform: Optional[str] = None,
+        session_api: Any = None,
     ) -> None:
         self._allow_execution = bool(allow_execution)
         self._runner = runner
         self._platform = platform if platform is not None else sys.platform
+        self._session_api = session_api
 
     def execute(self, action: PowerAction) -> PowerResult:
         try:
@@ -55,8 +56,10 @@ class PowerController:
         if self._platform != "win32":
             return PowerResult(action, False, "power control is only supported on Windows")
 
-        command = list(self._COMMANDS[action])
         try:
+            if action == PowerAction.LOGOFF:
+                return self._logoff_session()
+            command = list(self._COMMANDS[action])
             kwargs = {
                 "capture_output": True,
                 "text": True,
@@ -77,6 +80,20 @@ class PowerController:
         except Exception as exc:
             logger.warning(f"Power command {action.value} failed: {exc}")
             return PowerResult(action, False, str(exc))
+
+    def _logoff_session(self) -> PowerResult:
+        session_api = self._session_api
+        if session_api is None:
+            import win32ts
+            session_api = win32ts
+        from .session_launcher import _active_session_id
+
+        session_id = _active_session_id(session_api)
+        if session_id is None or session_id <= 0:
+            return PowerResult(PowerAction.LOGOFF, False, "no active desktop session")
+        # 服务运行在会话 0，shutdown /l 只作用于调用会话；必须显式定位学生桌面。
+        session_api.WTSLogoffSession(None, session_id, False)
+        return PowerResult(PowerAction.LOGOFF, True, "user session logoff accepted", 0)
 
     def shutdown(self) -> PowerResult:
         return self.execute(PowerAction.SHUTDOWN)

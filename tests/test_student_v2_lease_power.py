@@ -128,7 +128,6 @@ def test_power_controller_is_disabled_until_explicitly_enabled():
     [
         (PowerAction.SHUTDOWN, ["shutdown.exe", "/s", "/t", "0"]),
         (PowerAction.RESTART, ["shutdown.exe", "/r", "/t", "0"]),
-        (PowerAction.LOGOFF, ["shutdown.exe", "/l"]),
     ],
 )
 def test_power_commands_are_mockable(action, expected):
@@ -145,6 +144,27 @@ def test_power_commands_are_mockable(action, expected):
     assert result.success
     assert calls[0][0] == expected
     assert calls[0][1]["timeout"] == 10
+
+
+@pytest.mark.parametrize("active_session", [1, None])
+def test_service_logoff_targets_logged_in_session(active_session):
+    calls = []
+    sessions = [] if active_session is None else [{"SessionId": active_session, "State": 0}]
+    session_api = SimpleNamespace(
+        WTSActive=0,
+        WTSGetActiveConsoleSessionId=lambda: 0xFFFFFFFF if active_session is None else active_session,
+        WTSEnumerateSessions=lambda *args: sessions,
+        WTSLogoffSession=lambda *args: calls.append(args),
+    )
+    runner = lambda *args, **kwargs: pytest.fail("不能在服务会话中执行 shutdown /l")
+    controller = PowerController(
+        True, runner=runner, platform="win32", session_api=session_api,
+    )
+
+    result = controller.logoff()
+
+    assert result.success == (active_session is not None)
+    assert calls == ([(None, active_session, False)] if active_session is not None else [])
 
 
 def test_magic_packet_has_standard_layout():

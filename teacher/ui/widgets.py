@@ -165,7 +165,9 @@ class SeatMapWidget(QScrollArea):
             self.selected.remove(device_id)
         else:
             self.selected.add(device_id)
-        self._render()
+        # 只更新选中样式，保留按住鼠标的控件，才能继续接收拖动事件。
+        for tile in self.canvas.findChildren(SeatTile):
+            tile.set_selected(tile.device.device_id in self.selected)
         self.selection_changed.emit(tuple(sorted(self.selected)))
 
     def dragEnterEvent(self, event) -> None:

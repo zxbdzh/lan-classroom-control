@@ -5,9 +5,10 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import os
 from typing import Dict, Mapping
 
-from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from common.config import get_config
 from common.screen_capture import ScreenCapturer
@@ -33,6 +34,13 @@ class DesktopSessionActions(QObject):
         self._input_reasons = set()
         self._broadcasting = False
         self._silence = False
+        self._silence_message = ""
+        self._remote_active = False
+        self._service_seen = time.monotonic()
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(500)
+        self._watchdog.timeout.connect(self._check_service)
+        self._watchdog.start()
         self._broadcast_receiver = None
         self._broadcast_fallback = None
         self._broadcast_timer = None
@@ -43,6 +51,18 @@ class DesktopSessionActions(QObject):
         self._inspection_tcp_sender = None
         self._capturer = None
         self.requested.connect(self._execute_requested)
+
+    def _check_service(self) -> None:
+        if time.monotonic() - self._service_seen > 12.0:
+            self.restore_all()
+        else:
+            self.input_blocker.renew()
+
+    def service_disconnected(self) -> None:
+        self.requested.emit({
+            "action": "restore_all", "params": {}, "event": threading.Event(),
+            "result": None, "error": None,
+        })
 
     def handle(self, action: str, params: Mapping[str, object]) -> dict:
         request = {
@@ -64,8 +84,10 @@ class DesktopSessionActions(QObject):
         try:
             action = request["action"]
             params = request["params"]
+            if action != "restore_all":
+                self._service_seen = time.monotonic()
             handlers = {
-                "ping": lambda _params: {"ready": True},
+                "ping": lambda _params: {"ready": True, "pid": os.getpid()},
                 "broadcast.start": self._broadcast_start,
                 "broadcast.stop": self._broadcast_stop,
                 "silence.start": self._silence_start,
@@ -89,16 +111,16 @@ class DesktopSessionActions(QObject):
             request["event"].set()
 
     def _input(self, reason: str, enabled: bool) -> dict:
-        was_locked = bool(self._input_reasons)
+        reasons = set(self._input_reasons)
         if enabled:
-            self._input_reasons.add(reason)
+            reasons.add(reason)
         else:
-            self._input_reasons.discard(reason)
-        is_locked = bool(self._input_reasons)
-        if is_locked and not was_locked:
-            self.input_blocker.block()
-        elif was_locked and not is_locked:
-            self.input_blocker.unblock()
+            reasons.discard(reason)
+        is_locked = bool(reasons) and not self._remote_active
+        success = self.input_blocker.block() if is_locked else self.input_blocker.unblock()
+        if not success:
+            raise RuntimeError("键鼠限制执行失败，未确认黑屏成功")
+        self._input_reasons = reasons
         return {"input_locked": is_locked}
 
     def _broadcast_start(self, params: Mapping[str, object]) -> dict:
@@ -122,7 +144,8 @@ class DesktopSessionActions(QObject):
             generation = self._broadcast_generation
         receiver.start()
         self._schedule_fallback_check(host, fallback_port, session_id, generation, 0.8)
-        self.overlay.show_broadcast()
+        if not self._remote_active and not self._silence:
+            self.overlay.show_broadcast()
         if params.get("lock_input", True):
             self._input("broadcast", True)
         return {"broadcasting": True}
@@ -207,14 +230,19 @@ class DesktopSessionActions(QObject):
         self.overlay.update_frame(frame.jpeg, (0, 0))
 
     def _silence_start(self, params: Mapping[str, object]) -> dict:
-        self._silence = True
-        self.overlay.show_black_screen(str(params.get("message") or ""))
         self._input("silence", True)
-        return {"silence": True}
+        self._silence = True
+        self._silence_message = str(params.get("message") or "")
+        if not self._remote_active:
+            self.overlay.show_black_screen(self._silence_message)
+        return {"silence": True, "suspended": self._remote_active,
+                "input_locked": not self._remote_active}
 
     def _silence_stop(self, _params: Mapping[str, object]) -> dict:
-        self._silence = False
         self._input("silence", False)
+        self._silence = False
+        if self._remote_active:
+            return {"silence": False}
         if self._broadcasting:
             self.overlay.show_broadcast()
         else:
@@ -222,6 +250,8 @@ class DesktopSessionActions(QObject):
         return {"silence": False}
 
     def _inspection_open(self, params: Mapping[str, object]) -> dict:
+        if self._remote_active:
+            return {"inspection": False, "suspended": True}
         self._inspection_close({})
         base_session = str(params.get("session_id") or "")
         if not base_session:
@@ -231,7 +261,9 @@ class DesktopSessionActions(QObject):
         stream_id = device_session_id(
             base_session, str(params.get("device_id") or self.device_id)
         )
-        self._inspection_sender = UdpMjpegSender(
+        # 巡视默认只走带重连和单槽缓冲的 TCP，避免 WiFi 同帧双发。
+        use_tcp = str(params.get("transport") or "tcp") != "udp"
+        self._inspection_sender = None if use_tcp else UdpMjpegSender(
             teacher_host,
             int(params.get("port") or self.config.get("student.inspection_port", 9530)),
             stream_id,
@@ -240,8 +272,9 @@ class DesktopSessionActions(QObject):
             teacher_host,
             int(params.get("fallback_port") or self.config.get("student.bulk_port", 9531)),
             stream_id,
-        )
-        self._inspection_tcp_sender.start()
+        ) if use_tcp else None
+        if self._inspection_tcp_sender:
+            self._inspection_tcp_sender.start()
         focus = mode in {"focus", "remote_control"}
         self._capturer = ScreenCapturer(
             monitor=1,
@@ -276,17 +309,28 @@ class DesktopSessionActions(QObject):
         return {"inspection": False}
 
     def _remote_start(self, params: Mapping[str, object]) -> dict:
-        result = self._inspection_open({**dict(params), "mode": "remote_control"})
-        self._input("remote_control", True)
-        result["remote_control"] = True
-        return result
+        self._inspection_close({})
+        self._remote_active = True
+        if not self.input_blocker.unblock():
+            self._remote_active = False
+            raise RuntimeError("无法解除原键鼠限制，取消远控")
+        self.overlay.hide_overlay()
+        return {"remote_control": True, "backend": "ultravnc"}
 
     def _remote_stop(self, _params: Mapping[str, object]) -> dict:
+        if not self._remote_active:
+            return {"remote_control": False}
+        self._remote_active = False
         self._input("remote_control", False)
-        self._inspection_close({})
+        if self._silence:
+            self.overlay.show_black_screen(self._silence_message)
+        elif self._broadcasting:
+            self.overlay.show_broadcast()
         return {"remote_control": False}
 
     def restore_all(self) -> dict:
+        self._input_reasons.clear()
+        self._remote_active = False
         self._broadcast_stop({})
         self._silence_stop({})
         self._remote_stop({})
@@ -295,6 +339,7 @@ class DesktopSessionActions(QObject):
         return {"restored": True}
 
     def close(self) -> None:
+        self._watchdog.stop()
         self.restore_all()
 
 

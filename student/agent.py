@@ -96,12 +96,18 @@ class StudentAgentApplication:
                 runtime.stop()
                 channel.close()
                 self._runtime = None
+                self.actions.service_disconnected()
             except Exception as exc:
                 logger.debug(f"Session agent pipe unavailable: {exc}")
+                self.actions.service_disconnected()
             self._stop_event.wait(2.0)
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--diagnostics":
+        from common.diagnostics import startup_probe
+        startup_probe("agent", sys.argv[2])
+        return
     if not acquire_agent_instance():
         return
     sys.exit(StudentAgentApplication().run())

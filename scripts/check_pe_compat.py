@@ -10,6 +10,22 @@ from dataclasses import asdict, dataclass
 from typing import Iterable, List, Sequence, Tuple
 
 
+def exclude_host_ucrt(binaries: Iterable[tuple]) -> List[tuple]:
+    # PE 最低版本不能发现新版 UCRT 的 API-set 依赖，必须在打包阶段排除。
+    return [
+        entry for entry in binaries
+        if os.path.basename(entry[0]).lower() != "ucrtbase.dll"
+        and not os.path.basename(entry[0]).lower().startswith("api-ms-win-")
+    ]
+
+
+def check_runtime_directory(directory: str) -> None:
+    binaries = [(name, "", "") for name in os.listdir(directory)]
+    retained = exclude_host_ucrt(binaries)
+    if len(retained) != len(binaries):
+        raise ValueError("{} bundles host UCRT/API-set DLLs".format(directory))
+
+
 @dataclass(frozen=True)
 class PeCompatibility:
     path: str
@@ -82,10 +98,13 @@ def check_compatibility(
 def main(argv: Sequence[str] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--maximum-version", default="6.1")
+    parser.add_argument("--runtime-directory", action="append", default=[])
     parser.add_argument("files", nargs="+")
     args = parser.parse_args(argv)
     try:
         maximum = parse_version(args.maximum_version)
+        for directory in args.runtime_directory:
+            check_runtime_directory(directory)
         results = check_compatibility(args.files, maximum)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

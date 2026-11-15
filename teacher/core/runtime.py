@@ -24,6 +24,7 @@ from teacher.core.state_store import SQLiteStateStore
 from teacher.core.teacher_server import TeacherServer
 from teacher.core.media_runtime import BroadcastPublisher, InspectionReceiver
 from common.v2.media_transport import TcpMediaHub
+from teacher.core.remote_control import RemoteControlWindows
 
 
 def default_teacher_database_path() -> str:
@@ -74,6 +75,8 @@ class TeacherRuntime:
         self._started = False
         self._broadcast_target_ids: Set[str] = set()
         self._inspection_sessions: Dict[str, str] = {}
+        self._remote_inspection: Set[str] = set()
+        self.remote_windows = RemoteControlWindows(self._remote_closed)
         self.wol_sender = WakeOnLanSender()
 
     def start(self) -> None:
@@ -85,6 +88,7 @@ class TeacherRuntime:
         self._started = True
 
     def close(self) -> None:
+        self.remote_windows.close()
         if self._started:
             self.broadcast_media.stop()
             self.inspection_media.stop()
@@ -105,11 +109,15 @@ class TeacherRuntime:
     def open_inspection(
         self, scope: TargetScope, mode: InspectionMode = InspectionMode.THUMBNAIL
     ):
+        available = [
+            device_id for device_id in self._resolve_target_ids(scope)
+            if device_id not in self.remote_windows.sessions
+        ]
         session = self.classroom.open_inspection(
-            scope,
+            DeviceIds(available),
             mode,
             {
-                "transport": "udp_tcp_fallback",
+                "transport": "tcp",
                 "port": self.inspection_media.port,
                 "fallback_port": self.tcp_media.port,
             },
@@ -123,6 +131,7 @@ class TeacherRuntime:
 
     def close_inspection(self, scope: TargetScope):
         receipt = self.submit(ClassroomAction(CommandKind.INSPECTION_CLOSE), scope)
+        self._remote_inspection.difference_update(receipt.target_ids)
         for device_id in receipt.target_ids:
             self._unregister_inspection(device_id)
         return receipt
@@ -188,6 +197,8 @@ class TeacherRuntime:
         return receipt
 
     def restore_all(self, scope: TargetScope):
+        for device_id in self._resolve_target_ids(scope):
+            self.remote_windows.stop(device_id)
         receipt = self.submit(ClassroomAction(CommandKind.RESTORE_ALL), scope)
         restored_ids = set(receipt.target_ids)
         self._broadcast_target_ids.difference_update(restored_ids)
@@ -239,6 +250,8 @@ class TeacherRuntime:
         )
 
     def send_remote_input(self, device_id: str, payload: Mapping[str, object]):
+        if device_id in self.remote_windows.sessions:
+            return False
         envelope = ControlEnvelope.command(
             CommandKind.REMOTE_INPUT.value,
             dict(payload),
@@ -248,6 +261,15 @@ class TeacherRuntime:
         return self.server.send(str(device_id), envelope)
 
     def start_remote_control(self, device_id: str):
+        if device_id in self.remote_windows.sessions:
+            raise RuntimeError("该设备已在 UltraVNC 会话中")
+        executable = self.remote_windows.prepare()
+        device = self.classroom.snapshot().device(device_id)
+        if device is None or not device.online:
+            raise RuntimeError("该设备不在线")
+        host = str(device.metadata.get("ip") or "")
+        if not host:
+            raise RuntimeError("该设备没有可连接的 IP 地址")
         session_id = str(uuid.uuid4())
         receipt = self.submit(
             ClassroomAction(
@@ -255,16 +277,15 @@ class TeacherRuntime:
                 {
                     "mode": InspectionMode.REMOTE_CONTROL.value,
                     "session_id": session_id,
-                    "transport": "udp_tcp_fallback",
-                    "port": self.inspection_media.port,
-                    "fallback_port": self.tcp_media.port,
+                    "backend": "ultravnc",
                 },
             ),
             TargetScope.devices([device_id]),
         )
+        if device_id in self._inspection_sessions:
+            self._remote_inspection.add(device_id)
         self._unregister_inspection(device_id)
-        self.inspection_media.register(session_id, [device_id])
-        self._inspection_sessions[device_id] = session_id
+        self.remote_windows.add(device_id, host, receipt.command_id, executable)
         return InspectionSession(
             session_id=session_id,
             command_id=receipt.command_id,
@@ -275,12 +296,27 @@ class TeacherRuntime:
         )
 
     def stop_remote_control(self, device_id: str):
+        if device_id in self.remote_windows.sessions:
+            self.remote_windows.stop(device_id)
+            return
+        return self._remote_closed(device_id)
+
+    def _remote_closed(self, device_id: str):
         receipt = self.submit(
             ClassroomAction(CommandKind.REMOTE_CONTROL_STOP),
             TargetScope.devices([device_id]),
         )
         self._unregister_inspection(device_id)
+        if device_id in self._remote_inspection:
+            self._remote_inspection.discard(device_id)
+            self.open_inspection(DeviceIds([device_id]))
         return receipt
+
+    def poll_remote_windows(self) -> tuple:
+        self.remote_windows.poll(self.classroom.snapshot())
+        messages = tuple(self.remote_windows.messages)
+        self.remote_windows.messages.clear()
+        return messages
 
     def _unregister_inspection(self, device_id: str) -> None:
         session_id = self._inspection_sessions.pop(str(device_id), None)
@@ -314,14 +350,20 @@ class TeacherRuntime:
 
     def _resolve_registered_identity(self, device_id: str, mac: str):
         snapshot = self.classroom.snapshot()
-        direct = snapshot.device(str(device_id))
-        if direct is not None:
-            return direct.device_id, direct.group
         normalized_mac = str(mac or "").strip().casefold()
         if normalized_mac:
             for device in snapshot.devices:
                 if str(device.metadata.get("mac") or "").strip().casefold() == normalized_mac:
                     return device.device_id, device.group
+        direct = snapshot.device(str(device_id))
+        if direct is not None:
+            previous_mac = str(direct.metadata.get("mac") or "").strip().casefold()
+            if previous_mac and normalized_mac and previous_mac != normalized_mac:
+                # 克隆镜像可能复制设备 ID；不同物理网卡不能互相挤掉在线连接。
+                return str(uuid.uuid5(
+                    uuid.NAMESPACE_OID, f"lan-classroom:{device_id}:{normalized_mac}"
+                )), "default"
+            return direct.device_id, direct.group
         return str(device_id), "default"
 
 

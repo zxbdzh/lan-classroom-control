@@ -428,14 +428,19 @@ start "" {restart_cmd}
         agent_backup = os.path.join(target_dir, ".Agent.rollback")
         staged_service = os.path.join(staging_dir, "Service")
         staged_agent = os.path.join(staging_dir, "Agent")
+        vnc_dir = os.path.join(target_dir, "UltraVNC")
+        vnc_backup = os.path.join(target_dir, ".UltraVNC.rollback")
+        staged_vnc = os.path.join(staging_dir, "UltraVNC")
         service_exe = os.path.join(service_dir, cls.SERVICE_EXE)
         agent_exe = os.path.join(agent_dir, cls.AGENT_EXE)
         return f"""@echo off
 {wait_block}sc stop "{cls.SERVICE_NAME}" >nul 2>&1
+sc stop "LanClassroomVNC" >nul 2>&1
 taskkill /IM "{cls.AGENT_EXE}" /F >nul 2>&1
 ping 127.0.0.1 -n 3 >nul
 rmdir /s /q "{service_backup}" 2>nul
 rmdir /s /q "{agent_backup}" 2>nul
+rmdir /s /q "{vnc_backup}" 2>nul
 move /Y "{service_dir}" "{service_backup}" >nul
 if errorlevel 1 goto rollback
 move /Y "{agent_dir}" "{agent_backup}" >nul
@@ -444,11 +449,17 @@ move /Y "{staged_service}" "{service_dir}" >nul
 if errorlevel 1 goto rollback
 move /Y "{staged_agent}" "{agent_dir}" >nul
 if errorlevel 1 goto rollback
+if exist "{staged_vnc}" (
+    if exist "{vnc_dir}" move /Y "{vnc_dir}" "{vnc_backup}" >nul
+    move /Y "{staged_vnc}" "{vnc_dir}" >nul
+    if errorlevel 1 goto rollback
+)
 "{service_exe}" --wait 20 start >nul 2>&1
 if errorlevel 1 goto rollback
 echo {target_version}> "{os.path.join(target_dir, 'version.txt')}"
 rmdir /s /q "{service_backup}" 2>nul
 rmdir /s /q "{agent_backup}" 2>nul
+rmdir /s /q "{vnc_backup}" 2>nul
 goto cleanup
 
 :rollback
@@ -459,6 +470,10 @@ if exist "{service_backup}" (
 if exist "{agent_backup}" (
     rmdir /s /q "{agent_dir}" 2>nul
     move /Y "{agent_backup}" "{agent_dir}" >nul
+)
+if exist "{vnc_backup}" (
+    rmdir /s /q "{vnc_dir}" 2>nul
+    move /Y "{vnc_backup}" "{vnc_dir}" >nul
 )
 if exist "{service_exe}" "{service_exe}" --wait 20 start >nul 2>&1
 

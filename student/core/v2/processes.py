@@ -29,6 +29,7 @@ DEFAULT_PROTECTED_PROCESS_NAMES = frozenset({
     "lanclassroom-student.exe",
     "lanclassroom-student-service.exe",
     "lanclassroom-student-agent.exe",
+    "winvnc.exe",
 })
 
 
@@ -143,7 +144,7 @@ class ProcessController:
             except Exception as exc:
                 return self._failure_from_exception(pid, exc, "open process")
 
-            if not math.isclose(
+            if not math.isfinite(float(expected_creation_time)) or not math.isclose(
                 actual_creation_time,
                 float(expected_creation_time),
                 rel_tol=0.0,

@@ -54,10 +54,11 @@ def launch_installed_agent(service_executable: Optional[str] = None) -> bool:
 
         token = win32ts.WTSQueryUserToken(session_id)
         primary = win32security.DuplicateTokenEx(
-            token,
-            win32con.MAXIMUM_ALLOWED,
-            win32security.SecurityImpersonation,
-            win32security.TokenPrimary,
+            # pywin32 的参数顺序不同于 C API；用关键字避免权限与模拟级别颠倒。
+            ExistingToken=token,
+            ImpersonationLevel=win32security.SecurityImpersonation,
+            DesiredAccess=win32con.MAXIMUM_ALLOWED,
+            TokenType=win32security.TokenPrimary,
         )
         environment = win32profile.CreateEnvironmentBlock(primary, False)
         startup = win32process.STARTUPINFO()

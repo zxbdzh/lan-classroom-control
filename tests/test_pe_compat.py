@@ -4,6 +4,8 @@ import pytest
 
 from scripts.check_pe_compat import (
     check_compatibility,
+    check_runtime_directory,
+    exclude_host_ucrt,
     parse_version,
     read_compatibility,
 )
@@ -50,3 +52,22 @@ def test_rejects_invalid_version_and_non_pe_file(tmp_path):
         parse_version("6")
     with pytest.raises(ValueError, match="not a PE"):
         read_compatibility(str(invalid))
+
+
+def test_pe_minimum_alone_does_not_allow_host_ucrt(tmp_path):
+    binary = tmp_path / "ucrtbase.dll"
+    write_pe(binary, os_version=(6, 1), subsystem_version=(6, 1))
+
+    check_compatibility([str(binary)], (6, 1))
+    with pytest.raises(ValueError, match="host UCRT"):
+        check_runtime_directory(str(tmp_path))
+
+
+def test_runtime_filter_preserves_python_and_visual_cpp_dependencies(tmp_path):
+    names = [
+        "UCRTBASE.dll", "api-ms-win-crt-runtime-l1-1-0.dll",
+        "python38.dll", "VCRUNTIME140.dll", "_socket.pyd",
+    ]
+    binaries = [(name, str(tmp_path / name), "BINARY") for name in names]
+
+    assert [entry[0] for entry in exclude_host_ucrt(binaries)] == names[2:]

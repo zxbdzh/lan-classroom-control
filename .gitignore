@@ -37,12 +37,14 @@ ENV/
 
 # Project
 *.spec
+!scripts/classroom.spec
 *.zip
 *.log
 .pytest_cache/
 .coverage
 htmlcov/
 .artifacts/
+third_party/ultravnc/
 
 # Config
 .lan_classroom/

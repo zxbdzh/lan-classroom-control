@@ -56,6 +56,7 @@ class OverlayWindow(QWidget):
     def show_black_screen(self, message: str = ""):
         self._visibility_generation += 1
         self._active = False
+        self._label.clear()
         self._label.setText("")
         self._label.setStyleSheet("background-color: black;")
         self._message_label.setText(message or "请保持安静，注意教师屏幕")
@@ -97,7 +98,6 @@ class OverlayWindow(QWidget):
             self.setGeometry(virtual_geometry)
         self.show()
         self.raise_()
-        self.activateWindow()
         self._force_windows_topmost()
         QTimer.singleShot(120, self._force_windows_topmost)
         QTimer.singleShot(500, self._force_windows_topmost)
@@ -112,6 +112,12 @@ class OverlayWindow(QWidget):
             SWP_NOMOVE = 0x0002
             SWP_NOSIZE = 0x0001
             SWP_SHOWWINDOW = 0x0040
+            SWP_NOACTIVATE = 0x0010
+            from ctypes import wintypes
+            ctypes.windll.user32.SetWindowPos.argtypes = (
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT,
+            )
             ctypes.windll.user32.SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -119,7 +125,7 @@ class OverlayWindow(QWidget):
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
             )
         except Exception as e:
             logger.debug(f"Force overlay topmost failed: {e}")

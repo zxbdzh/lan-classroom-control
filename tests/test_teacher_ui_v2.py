@@ -1,15 +1,18 @@
 import os
 import threading
 from unittest.mock import MagicMock, patch
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent, Qt
+from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidgetItem
 from PyQt5.QtGui import QPixmap
 
 from teacher.core.classroom import TransportDevice
 from teacher.core.runtime import TeacherRuntime
-from common.v2.model import DeviceIds, InspectionMode
+from common.v2.model import CommandKind, DeviceIds, InspectionMode
 from teacher.ui.main_window import TeacherMainWindow
 from teacher.ui.widgets import EmptySeat, FullScreenViewer, SeatTile
 from student.ui.overlay import OverlayWindow
@@ -141,4 +144,83 @@ def test_selected_devices_can_be_assigned_to_a_group(qtbot):
 
     runtime.set_group.assert_called_once_with(["pc-01", "pc-02"], "第一组")
     assert "2" in window.operation_status.text()
+    window.close()
+
+
+def test_pressing_seat_preserves_drag_source_until_mouse_release(qtbot):
+    runtime = TeacherRuntime(database_path=":memory:")
+    runtime.classroom._on_device(TransportDevice(device_id="pc-01", hostname="PC-01"))
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window.show()
+    window._poll_runtime()
+    QApplication.processEvents()
+    source = window.seat_map.findChild(SeatTile)
+
+    qtbot.mousePress(source, Qt.LeftButton)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    # 按下后还要由同一控件接收移动和释放，选中反馈不能销毁拖动起点。
+    assert not sip.isdeleted(source)
+    assert source.property("selected") is True
+    assert window._selected_ids == {"pc-01"}
+    qtbot.mouseRelease(source, Qt.LeftButton)
+    window.close()
+
+
+@pytest.mark.parametrize("label, kind", [
+    ("关机", CommandKind.POWER_OFF),
+    ("重启", CommandKind.REBOOT),
+    ("注销", CommandKind.LOGOFF),
+])
+@pytest.mark.parametrize("answer", [QMessageBox.Yes, QMessageBox.No])
+def test_power_buttons_confirm_current_scope_without_slot_errors(qtbot, label, kind, answer):
+    runtime = TeacherRuntime(database_path=":memory:")
+    # 宿主只验证按钮和确认链路，电源执行使用替身；真实效果仅在实验来宾验收。
+    runtime.power = MagicMock()
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window.show()
+    window._show_page("maintenance")
+    button = next(item for item in window.findChildren(QPushButton) if item.text() == label)
+
+    with patch("teacher.ui.main_window.QMessageBox.question", return_value=answer) as confirm:
+        with qtbot.captureExceptions() as exceptions:
+            qtbot.mouseClick(button, Qt.LeftButton)
+        assert not exceptions
+
+    confirm.assert_called_once_with(window, label, f"确定对当前作用域执行{label}？")
+    if answer == QMessageBox.Yes:
+        runtime.power.assert_called_once_with(window._current_scope(), kind)
+    else:
+        runtime.power.assert_not_called()
+    window.close()
+
+
+@pytest.mark.parametrize("device_disappears", [False, True])
+def test_process_device_change_clears_old_rows_and_pending_query(qtbot, device_disappears):
+    runtime = TeacherRuntime(database_path=":memory:")
+    for device_id in ("pc-01", "pc-02"):
+        runtime.classroom._on_device(TransportDevice(device_id=device_id, hostname=device_id))
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window._poll_runtime()
+    window.process_table.setRowCount(1)
+    window.process_table.setItem(0, 0, QTableWidgetItem("1234"))
+    window._process_command_id = "old-device-query"
+
+    if device_disappears:
+        remaining = window._snapshot.device("pc-02")
+        window._snapshot = MagicMock(devices=(remaining,))
+        window._refresh_device_tables()
+    else:
+        window.process_device.setCurrentIndex(1)
+
+    assert window.process_device.currentData() == "pc-02"
+    assert window.process_table.rowCount() == 0
+    assert window._process_command_id is None
+    # 旧设备迟到的查询结果不能重新填回当前设备的表格。
+    late_snapshot = MagicMock()
+    window._consume_process_result(late_snapshot)
+    late_snapshot.operation.assert_not_called()
     window.close()

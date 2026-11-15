@@ -60,21 +60,30 @@ class BlacklistEnforcer:
         self._interval = float(interval)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._enforce_lock = threading.Lock()
 
     def enforce_once(self) -> List[EnforcementResult]:
+        with self._enforce_lock:
+            return self._enforce_once()
+
+    def _enforce_once(self) -> List[EnforcementResult]:
         rules = self._store.list_blacklist_rules()
         if not rules:
             return []
         processes = self._process_controller.list_processes()
         results: List[EnforcementResult] = []
         for process in processes:
+            if process.protected:
+                continue
             rule = self._first_match(process, rules)
             if rule is None:
                 continue
             termination = self._process_controller.terminate_process(
                 process.pid,
                 process.creation_time,
+                timeout=0.25,
+                force=True,
             )
             results.append(EnforcementResult(rule, process, termination))
             if not termination.success:

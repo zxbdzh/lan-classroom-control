@@ -115,7 +115,7 @@ class _RecordingProcessController:
     def list_processes(self):
         return list(self.processes)
 
-    def terminate_process(self, pid, expected_creation_time):
+    def terminate_process(self, pid, expected_creation_time, timeout=3.0, force=False):
         self.terminated.append((pid, expected_creation_time))
         return ProcessTerminationResult(
             pid,

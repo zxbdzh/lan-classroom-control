@@ -50,10 +50,18 @@ class TestInputBlocker:
         if sys.platform != 'win32':
             pytest.skip("Windows only test")
         blocker = InputBlocker()
-        blocker.block()
-        assert blocker.is_blocked() is True
-        blocker.unblock()
+        import threading
+        calls = []
+        with patch.object(ctypes.windll.user32, "BlockInput", side_effect=lambda enabled: (
+            calls.append((enabled, threading.get_ident())) or True
+        )):
+            assert blocker.block()
+            assert blocker.is_blocked()
+            assert blocker.unblock()
         assert blocker.is_blocked() is False
+        assert [enabled for enabled, _ in calls] == [True, False]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][1] != threading.get_ident()
 
     def test_windows_fallback_listeners_are_always_stopped(self):
         blocker = InputBlocker()
@@ -74,7 +82,12 @@ class TestInputBlocker:
 
         fallback.assert_called_once_with()
         cleanup.assert_called_once_with()
-        assert user32.BlockInput.call_args_list == [
-            call(True),
-            call(False),
-        ]
+        assert user32.BlockInput.call_args_list == [call(True)]
+
+    def test_failed_fallback_does_not_claim_locked(self):
+        blocker = InputBlocker()
+        with patch.object(blocker, "_block_windows", return_value=False), patch.object(
+            blocker, "_block_pynput", return_value=False
+        ):
+            assert not blocker.block()
+            assert not blocker.is_blocked()

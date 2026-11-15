@@ -56,16 +56,19 @@ def _legacy_config_paths() -> List[str]:
 
 def normalize_executable_name(executable_name: str) -> str:
     """Return the case-insensitive Windows basename used for matching."""
-    value = (executable_name or "").strip().replace("/", "\\")
+    value = (executable_name or "").strip().strip('"').replace("/", "\\")
     name = ntpath.basename(value).strip()
     if not name:
         raise ValueError("executable_name must not be empty")
+    # 教师通常输入软件名，统一补全后缀以匹配 Windows 进程名。
+    if "." not in name and name.casefold() not in {"system", "registry"}:
+        name += ".exe"
     return name.casefold()
 
 
 def normalize_windows_path(path: str) -> str:
     """Normalize a Windows executable path independent of the host OS."""
-    value = (path or "").strip().replace("/", "\\")
+    value = os.path.expandvars((path or "").strip().strip('"')).replace("/", "\\")
     if not value:
         raise ValueError("path must not be empty")
     return ntpath.normcase(ntpath.normpath(value))

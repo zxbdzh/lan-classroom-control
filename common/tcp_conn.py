@@ -85,6 +85,8 @@ class TCPConnection:
             return True
         except Exception as e:
             logger.debug(f"Send error to {self.addr}: {e}")
+            # sendall 失败可能已经发出半个包，关闭连接才能安全重新分帧。
+            self.stop()
             return False
 
     def send_binary(self, data: bytes) -> bool:
@@ -94,6 +96,7 @@ class TCPConnection:
             return True
         except Exception as e:
             logger.debug(f"Send binary error to {self.addr}: {e}")
+            self.stop()
             return False
 
     def is_alive(self) -> bool:
@@ -143,7 +146,8 @@ class TCPServer:
         while self._running:
             try:
                 sock, addr = self._sock.accept()
-                sock.settimeout(None)
+                sock.settimeout(3.0)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn = TCPConnection(sock, addr)
                 conn.on_message = self._handle_message
                 conn.on_disconnect = self._handle_disconnect
@@ -215,7 +219,8 @@ class TCPClient:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((self.server_host, self.server_port))
-            sock.settimeout(None)
+            sock.settimeout(3.0)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._conn = TCPConnection(sock, (self.server_host, self.server_port))
             self._conn.on_message = self._handle_message
             self._conn.on_disconnect = self._handle_disconnect
