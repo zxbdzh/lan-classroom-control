@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
 
 from common.config import get_config
 from common.logger import get_logger
+from common.version import get_version
 from common.v2.model import (
     ClassroomAction,
     CommandKind,
@@ -177,7 +178,7 @@ class TeacherMainWindow(QMainWindow):
             if index == 0:
                 button.setChecked(True)
         layout.addStretch()
-        self.version_label = QLabel("v2.0.0")
+        self.version_label = QLabel(f"v{get_version()}")
         self.version_label.setProperty("muted", True)
         self.version_label.setContentsMargins(8, 0, 0, 0)
         layout.addWidget(self.version_label)

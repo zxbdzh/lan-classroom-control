@@ -13,7 +13,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8-3776ab?logo=python&logoColor=white)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15.2-41cd52)
 ![Platform](https://img.shields.io/badge/Windows-7%20SP1%20%7C%2010%20x64-0078d4?logo=windows&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-pytest%20%C3%9796-f2a1c1)
+![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97363-f2a1c1)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
