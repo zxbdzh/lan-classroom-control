@@ -326,9 +326,19 @@ class TcpMediaHub:
                 if listener is None:
                     return
                 connection, _address = listener.accept()
-                connection.settimeout(5.0)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._stop_event.is_set():
+                    logger.warning("TCP media hub accept failed")
+                return
+            try:
+                connection.settimeout(2.0)
                 role = _recv_exact(connection, 1)
                 connection.settimeout(None)
+                if self._stop_event.is_set():
+                    connection.close()
+                    return
                 if role == b"D":
                     downlink = _TcpDownlinkWriter(connection, self._remove_downlink)
                     with self._lock:
@@ -342,12 +352,13 @@ class TcpMediaHub:
                     ).start()
                 else:
                     connection.close()
-            except socket.timeout:
-                continue
             except OSError:
-                if not self._stop_event.is_set():
-                    logger.warning("TCP media hub accept failed")
-                return
+                # 断线属于该学生的握手失败，不能结束全班共用的监听线程。
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                continue
 
     def _remove_downlink(self, downlink: _TcpDownlinkWriter) -> None:
         with self._lock:
@@ -387,6 +398,7 @@ class TcpMjpegDownlink:
         *,
         connect_timeout: float = 3.0,
         reconnect_interval: float = 0.5,
+        frame_timeout: float = 2.0,
         connection_factory: Callable[..., socket.socket] = socket.create_connection,
     ) -> None:
         self.host, self.port = str(host), int(port)
@@ -394,6 +406,9 @@ class TcpMjpegDownlink:
         self._on_frame = on_frame
         self.connect_timeout = float(connect_timeout)
         self.reconnect_interval = float(reconnect_interval)
+        self.frame_timeout = float(frame_timeout)
+        if self.frame_timeout <= 0:
+            raise ValueError("frame_timeout must be positive")
         self._connection_factory = connection_factory
         self._socket = None
         self._stop_event = threading.Event()
@@ -416,6 +431,10 @@ class TcpMjpegDownlink:
         self._socket = None
         if connection:
             try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 connection.close()
             except OSError:
                 pass
@@ -431,9 +450,13 @@ class TcpMjpegDownlink:
                 connection = self._connection_factory(
                     (self.host, self.port), timeout=self.connect_timeout
                 )
+                if self._stop_event.is_set():
+                    return
                 connection.sendall(b"D")
-                connection.settimeout(None)
+                # TCP 仍连接不代表媒体可用；空流和半帧都必须超时重连，避免永久黑屏。
+                connection.settimeout(self.frame_timeout)
                 self._socket = connection
+                received_frame = False
                 while not self._stop_event.is_set():
                     header = _recv_exact(connection, _TCP_FRAME_HEADER.size)
                     session, frame_id, timestamp_ms, size = _TCP_FRAME_HEADER.unpack(header)
@@ -442,9 +465,16 @@ class TcpMjpegDownlink:
                     jpeg = _recv_exact(connection, size)
                     frame = MediaFrame(uuid.UUID(bytes=session), frame_id, timestamp_ms, jpeg)
                     if frame.session_id == self.session_id:
+                        if not received_frame:
+                            logger.info(f"TCP broadcast receiving frames from {self.host}:{self.port}")
+                            received_frame = True
                         self._on_frame(frame)
-            except (OSError, MediaProtocolError):
-                pass
+            except socket.timeout:
+                if connection is not None and not self._stop_event.is_set():
+                    logger.warning(f"TCP broadcast stalled; reconnecting to {self.host}:{self.port}")
+            except (OSError, MediaProtocolError) as exc:
+                if not self._stop_event.is_set():
+                    logger.debug(f"TCP broadcast disconnected; reconnecting: {exc}")
             finally:
                 if self._socket is connection:
                     self._socket = None

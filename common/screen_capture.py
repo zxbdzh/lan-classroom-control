@@ -27,6 +27,8 @@ class ScreenCapturer:
         self.max_width = max_width
         self.max_height = max_height
         self._running = False
+        self._stop_event = threading.Event()
+        self.recovery_interval = 0.5
         self._thread = None
         self._last_frame: Optional[Image.Image] = None
         self._frame_lock = threading.Lock()
@@ -37,57 +39,71 @@ class ScreenCapturer:
         self._frame_size: Tuple[int, int] = (0, 0)
 
     def start(self, on_frame_callback=None):
-        if self._running:
+        if self._thread and self._thread.is_alive():
             return
         self._on_frame = on_frame_callback
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
         logger.info(f"Screen capturer started, monitor={self.monitor}, fps={self.fps}")
 
     def stop(self):
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
+        self._stop_event.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=3)
+        if thread is None or not thread.is_alive():
             self._thread = None
-        self._sct = None
         logger.info("Screen capturer stopped")
 
     def _capture_loop(self):
         if not MSS_AVAILABLE:
             logger.error("mss is not available, cannot capture screen")
+            self._running = False
             return
+        recovering = False
         try:
-            with mss.mss() as sct:
-                self._sct = sct
-                monitors = sct.monitors
-                if self.monitor >= len(monitors):
-                    logger.warning(f"Monitor {self.monitor} not found, using monitor 0")
-                    self.monitor = 0
-                monitor_info = monitors[self.monitor]
-                self._frame_size = (monitor_info["width"], monitor_info["height"])
-                while self._running:
-                    start_time = time.monotonic()
-                    try:
-                        raw = sct.grab(monitor_info)
-                        if not raw or not raw.rgb:
-                            continue
-                        img = Image.frombytes("RGB", raw.size, raw.rgb)
-                        img = self._resize_frame(img)
-                        jpeg_data = self._compress_frame(img)
-                        with self._frame_lock:
-                            self._current_frame = jpeg_data
-                            self._last_frame = img
-                        if self._on_frame:
-                            self._on_frame(jpeg_data, img.size)
-                    except Exception as e:
-                        logger.debug(f"Capture error: {e}")
-                    elapsed = time.monotonic() - start_time
-                    sleep_time = self._frame_interval - elapsed
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
+            while not self._stop_event.is_set():
+                try:
+                    # 登录、显示器变化和驱动重置会使 GDI 句柄失效；在采集线程重建整个上下文。
+                    with mss.mss() as sct:
+                        self._sct = sct
+                        monitors = sct.monitors
+                        monitor_index = self.monitor if 0 <= self.monitor < len(monitors) else 0
+                        monitor_info = monitors[monitor_index]
+                        self._frame_size = (monitor_info["width"], monitor_info["height"])
+                        while not self._stop_event.is_set():
+                            start_time = time.monotonic()
+                            raw = sct.grab(monitor_info)
+                            if not raw or not raw.rgb:
+                                raise RuntimeError("Screen capture returned an empty image")
+                            img = self._resize_frame(Image.frombytes("RGB", raw.size, raw.rgb))
+                            jpeg_data = self._compress_frame(img)
+                            with self._frame_lock:
+                                self._current_frame = jpeg_data
+                                self._last_frame = img
+                            if recovering:
+                                logger.info("Screen capture recovered")
+                                recovering = False
+                            if self._on_frame:
+                                try:
+                                    self._on_frame(jpeg_data, img.size)
+                                except Exception as exc:
+                                    logger.debug(f"Frame delivery error: {exc}")
+                            elapsed = time.monotonic() - start_time
+                            self._stop_event.wait(max(0.0, self._frame_interval - elapsed))
+                except Exception as exc:
+                    if not recovering:
+                        logger.warning(f"Screen capture unavailable; retrying: {exc}")
+                    recovering = True
+                    # 必须退避并可被 stop 打断，避免空图/初始化失败时忙循环占满 CPU。
+                    self._sct = None
+                    self._stop_event.wait(self.recovery_interval)
         finally:
             self._sct = None
+            self._running = False
 
     def _compress_frame(self, img: Image.Image) -> bytes:
         buf = io.BytesIO()

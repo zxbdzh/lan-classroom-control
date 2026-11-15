@@ -1,4 +1,5 @@
 import struct
+import socket
 import uuid
 import threading
 import time
@@ -17,12 +18,14 @@ from common.v2.media import (
 )
 from common.v2.media_transport import (
     _TcpDownlinkWriter,
+    _tcp_packet,
     TcpMediaHub,
     TcpMjpegDownlink,
     TcpMjpegUplink,
     device_session_id,
 )
 from student.core.v2.session_actions import DesktopSessionActions
+from teacher.core.media_runtime import BroadcastPublisher
 
 
 def jpeg(size=400):
@@ -381,3 +384,93 @@ def test_session_agent_starts_tcp_fallback_when_udp_becomes_stale(qtbot):
         actions._broadcast_fallback_frame(frame)
     actions.overlay.update_frame.assert_called_once_with(frame.jpeg, (0, 0))
     actions.close()
+
+
+@pytest.mark.parametrize("partial_frame", [False, True])
+def test_broadcast_downlink_reconnects_when_connected_peer_stops_delivering_frames(
+    partial_frame,
+):
+    session_id = uuid.uuid4()
+    delivered = threading.Event()
+    release = threading.Event()
+    connections = []
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(1.0)
+    packet = _tcp_packet(session_id, 1, jpeg(240))
+
+    def serve():
+        try:
+            stalled, _address = listener.accept()
+            connections.append(stalled)
+            stalled.recv(1)
+            if partial_frame:
+                stalled.sendall(packet[:-10])
+            recovered, _address = listener.accept()
+            connections.append(recovered)
+            recovered.recv(1)
+            recovered.sendall(packet)
+            release.wait(2)
+        except OSError:
+            return
+
+    server = threading.Thread(target=serve, daemon=True)
+    downlink = TcpMjpegDownlink(
+        "127.0.0.1", listener.getsockname()[1], session_id,
+        lambda frame: delivered.set() if frame.jpeg == jpeg(240) else None,
+        connect_timeout=0.05, reconnect_interval=0.01,
+    )
+    downlink.frame_timeout = 0.05
+    server.start()
+    downlink.start()
+    try:
+        assert delivered.wait(1.0), "连接仍在但无完整画面时，应自动重连而非一直黑屏"
+    finally:
+        release.set()
+        listener.close()
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        downlink.stop()
+        server.join(timeout=1)
+
+
+def test_broadcast_udp_failure_does_not_interrupt_tcp_fallback():
+    hub = MagicMock()
+    publisher = BroadcastPublisher("239.255.95.29", 9529, 20, 70, hub)
+    publisher._session_id = uuid.uuid4()
+    publisher._sender = MagicMock()
+    publisher._sender.send_frame.side_effect = OSError("multicast unavailable")
+    frame = jpeg(240)
+
+    publisher._publish(frame, (32, 16))
+
+    hub.broadcast.assert_called_once_with(publisher._session_id, frame)
+
+
+def test_tcp_media_hub_keeps_accepting_after_peer_disconnects_during_handshake():
+    session_id = uuid.uuid4()
+    delivered = threading.Event()
+    hub = TcpMediaHub(0, lambda _frame: None)
+    hub.start()
+    interrupted = socket.create_connection(("127.0.0.1", hub.port), timeout=0.2)
+    interrupted.close()
+    time.sleep(0.05)
+    downlink = TcpMjpegDownlink(
+        "127.0.0.1", hub.port, session_id, lambda _frame: delivered.set(),
+        connect_timeout=0.1, reconnect_interval=0.01,
+    )
+    downlink.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not delivered.is_set():
+            hub.broadcast(session_id, jpeg(240))
+            delivered.wait(0.02)
+        assert delivered.is_set(), "一个学生握手断线不能让整个教师媒体监听永久退出"
+    finally:
+        downlink.stop()
+        hub.stop()

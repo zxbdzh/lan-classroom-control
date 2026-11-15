@@ -7,10 +7,13 @@ import uuid
 from typing import Callable, Dict, Iterable, Optional
 
 from common.screen_capture import ScreenCapturer
+from common.logger import get_logger
 from common.v2.media import LatestFrame, MediaFrame
 from common.v2.media_transport import (
     TcpMediaHub, UdpMjpegReceiver, UdpMjpegSender, device_session_id,
 )
+
+logger = get_logger("teacher_media")
 
 
 class BroadcastPublisher:
@@ -35,11 +38,13 @@ class BroadcastPublisher:
         self._lock = threading.RLock()
         self._tcp_hub = tcp_hub
         self._session_id = None
+        self._udp_error_reported = False
 
     def start(self, session_id: str, monitor: int = 0) -> None:
         self.stop()
         with self._lock:
             self._session_id = uuid.UUID(str(session_id))
+            self._udp_error_reported = False
             self._sender = UdpMjpegSender(
                 self.group, self.port, self._session_id
             )
@@ -67,12 +72,20 @@ class BroadcastPublisher:
     def _publish(self, jpeg: bytes, _size: tuple) -> None:
         with self._lock:
             sender = self._sender
-        if sender is not None:
-            sender.send_frame(jpeg)
-        with self._lock:
             session_id = self._session_id
+        # 先发布独立 TCP 备用画面，组播路由失效不能连带阻断备用通道。
         if self._tcp_hub is not None and session_id is not None:
             self._tcp_hub.broadcast(session_id, jpeg)
+        if sender is not None:
+            try:
+                sender.send_frame(jpeg)
+                if self._udp_error_reported:
+                    logger.info("Broadcast multicast recovered")
+                self._udp_error_reported = False
+            except OSError as exc:
+                if not self._udp_error_reported:
+                    logger.warning(f"Broadcast multicast unavailable; TCP remains active: {exc}")
+                self._udp_error_reported = True
 
 
 class InspectionReceiver:
