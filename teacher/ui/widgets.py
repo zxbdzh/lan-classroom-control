@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -112,11 +113,27 @@ class FileDropTable(QTableWidget):
 class DeviceNameWidget(QWidget):
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
 
     def __init__(self, device, dark: bool = False, parent=None) -> None:
         super().__init__(parent)
         self.device_id = device.device_id
         self._hostname = device.hostname
+        self.device_menu = QMenu(self)
+        self.device_menu.addAction("复制设备名").triggered.connect(
+            lambda _checked: self.copy_requested.emit(self.device_id)
+        )
+        self.device_menu.addAction("编辑备注").triggered.connect(
+            lambda _checked: self.note_requested.emit(self.device_id)
+        )
+        self.device_menu.addSeparator()
+        self.remove_action = self.device_menu.addAction("移除设备")
+        self.remove_action.triggered.connect(lambda _checked: self.remove_requested.emit(self.device_id))
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda point: self.device_menu.popup(self.mapToGlobal(point))
+        )
+        self.setToolTip("右键可复制设备名、编辑备注或移除设备")
         self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -175,6 +192,7 @@ class SeatTile(QFrame):
     clicked = pyqtSignal(str, bool)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
 
     def __init__(self, device, parent=None) -> None:
         super().__init__(parent)
@@ -192,6 +210,11 @@ class SeatTile(QFrame):
         self.name = DeviceNameWidget(device)
         self.name.copy_requested.connect(self.copy_requested.emit)
         self.name.note_requested.connect(self.note_requested.emit)
+        self.name.remove_requested.connect(self.remove_requested.emit)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda point: self.name.device_menu.popup(self.mapToGlobal(point))
+        )
         self.dot = QLabel("●")
         self.dot.setStyleSheet(
             "color: #16836B;" if device.online else "color: #98A2B3;"
@@ -240,6 +263,7 @@ class SeatMapWidget(QScrollArea):
     positions_changed = pyqtSignal(dict)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
 
     def __init__(self, columns: int = 6, rows: int = 10, parent=None) -> None:
         super().__init__(parent)
@@ -280,6 +304,8 @@ class SeatMapWidget(QScrollArea):
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget():
+                item.widget().hide()
+                # 右键菜单可能仍在发送信号，保留父对象所有权到事件循环延迟销毁。
                 item.widget().deleteLater()
         lectern = QLabel("讲台  ·  教师端")
         lectern.setObjectName("Lectern")
@@ -298,6 +324,7 @@ class SeatMapWidget(QScrollArea):
                 widget.clicked.connect(self._select)
                 widget.copy_requested.connect(self.copy_requested.emit)
                 widget.note_requested.connect(self.note_requested.emit)
+                widget.remove_requested.connect(self.remove_requested.emit)
             self.grid.addWidget(widget, row + 1, column)
         row_count = (capacity + self.columns - 1) // self.columns
         self.grid.setRowStretch(row_count + 1, 1)
@@ -347,6 +374,7 @@ class PatrolCard(QFrame):
     opened = pyqtSignal(str)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
+    remove_requested = pyqtSignal(str)
 
     def __init__(self, device, parent=None) -> None:
         super().__init__(parent)
@@ -356,17 +384,23 @@ class PatrolCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.image = QLabel("等待画面")
+        self.image = QLabel("等待画面" if device.online else "设备离线")
         self.image.setAlignment(Qt.AlignCenter)
         self.image.setStyleSheet("color:#98A2B3; background:#0D1117;")
         self.image.setMinimumHeight(124)
         footer = QFrame()
-        footer.setStyleSheet("background:#171C24;")
+        footer.setObjectName("PatrolFooter")
+        footer.setStyleSheet("QFrame#PatrolFooter { background:#171C24; }")
         footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(9, 7, 9, 7)
         self.name = DeviceNameWidget(device, dark=True)
         self.name.copy_requested.connect(self.copy_requested.emit)
         self.name.note_requested.connect(self.note_requested.emit)
+        self.name.remove_requested.connect(self.remove_requested.emit)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda point: self.name.device_menu.popup(self.mapToGlobal(point))
+        )
         footer_layout.addWidget(self.name)
         layout.addWidget(self.image, 1)
         layout.addWidget(footer)

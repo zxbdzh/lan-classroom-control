@@ -281,6 +281,7 @@ class TeacherMainWindow(QMainWindow):
         self.seat_map.positions_changed.connect(self._save_seat_positions)
         self.seat_map.copy_requested.connect(self._copy_device_name)
         self.seat_map.note_requested.connect(self._edit_device_note)
+        self.seat_map.remove_requested.connect(self._remove_device)
         self.classroom_search = search
         layout.addWidget(self.seat_map, 1)
         return page
@@ -518,7 +519,21 @@ class TeacherMainWindow(QMainWindow):
         usb_hint.setWordWrap(True)
         usb_hint.setProperty("muted", True)
         layout.addWidget(usb_hint)
+        cleanup = QHBoxLayout()
+        remove_selected = QPushButton("移除所选设备")
+        remove_selected.clicked.connect(self._remove_selected_devices)
+        clear_offline = QPushButton("清理离线设备")
+        clear_offline.clicked.connect(self._remove_offline_devices)
+        cleanup.addWidget(remove_selected)
+        cleanup.addWidget(clear_offline)
+        cleanup_hint = QLabel("也可右键设备卡片移除；学生重新连接后会重新加入。")
+        cleanup_hint.setProperty("muted", True)
+        cleanup_hint.setWordWrap(True)
+        cleanup.addWidget(cleanup_hint, 1)
+        layout.addLayout(cleanup)
         self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态", "USB 策略"))
+        self.maintenance_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.maintenance_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.maintenance_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         self.maintenance_table.setColumnWidth(0, 235)
         layout.addWidget(self.maintenance_table, 1)
@@ -830,6 +845,72 @@ class TeacherMainWindow(QMainWindow):
             logger.warning(f"Cannot save device note for {device_id}: {exc}")
             QMessageBox.warning(self, "备注保存失败", str(exc))
 
+    def _remove_device(self, device_id: str) -> None:
+        self._confirm_remove_devices([device_id])
+
+    def _remove_selected_devices(self) -> None:
+        rows = self.maintenance_table.selectionModel().selectedRows(0)
+        device_ids = [
+            str(self.maintenance_table.item(index.row(), 0).data(Qt.UserRole)) for index in rows
+        ] or sorted(self._selected_ids)
+        if not device_ids:
+            self.operation_status.setText("请先选择要移除的设备")
+            return
+        self._confirm_remove_devices(device_ids)
+
+    def _remove_offline_devices(self) -> None:
+        snapshot = self.runtime.snapshot()
+        device_ids = [device.device_id for device in snapshot.devices if not device.online]
+        if not device_ids:
+            self.operation_status.setText("没有需要清理的离线设备")
+            return
+        self._confirm_remove_devices(device_ids, offline_only=True)
+
+    def _confirm_remove_devices(self, device_ids: List[str], offline_only: bool = False) -> None:
+        snapshot = self.runtime.snapshot()
+        requested = set(device_ids)
+        targets = [
+            device for device in snapshot.devices if device.device_id in requested
+            and (not offline_only or not device.online)
+        ]
+        if not targets:
+            return
+        details = "\n".join(
+            f"{device.hostname} · {device.metadata.get('ip', '无 IP')} · {device.device_id}"
+            + (f" · {device.note}" if device.note else "")
+            for device in targets[:8]
+        )
+        if len(targets) > 8:
+            details += f"\n另有 {len(targets) - 8} 台"
+        message = (
+            f"确定从设备列表移除这 {len(targets)} 台设备？\n\n{details}\n\n"
+            "在线设备会退出巡视、远控并解除临时控制。历史记录和备注保留，"
+            "不会卸载学生端；学生重新连接后会重新加入。"
+        )
+        if QMessageBox.question(
+            self, "移除设备", message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            removed = set(self.runtime.remove_devices(
+                [device.device_id for device in targets], offline_only=offline_only,
+            ))
+            self._selected_ids.difference_update(removed)
+            self._patrol_target_ids.difference_update(removed)
+            positions = dict(self.config.get("ui.seat_positions", {}))
+            for device_id in removed:
+                positions.pop(device_id, None)
+                viewer = self._viewers.pop(device_id, None)
+                if viewer:
+                    viewer.close()
+            self._save_seat_positions(positions)
+            self._poll_runtime()
+            self._scope_changed()
+            self.operation_status.setText(f"已移除 {len(removed)} 台设备，重新连接后会重新加入")
+        except Exception as exc:
+            logger.warning(f"Cannot remove devices: {exc}")
+            QMessageBox.warning(self, "移除失败", str(exc))
+
     def _set_selected_group(self) -> None:
         if not self._selected_ids:
             QMessageBox.warning(self, "无法分组", "请先选择学生设备")
@@ -849,6 +930,7 @@ class TeacherMainWindow(QMainWindow):
         while self.patrol_grid.count():
             item = self.patrol_grid.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         self._patrol_cards.clear()
         if not self._snapshot:
@@ -858,6 +940,7 @@ class TeacherMainWindow(QMainWindow):
             card.opened.connect(self._open_viewer)
             card.copy_requested.connect(self._copy_device_name)
             card.note_requested.connect(self._edit_device_note)
+            card.remove_requested.connect(self._remove_device)
             self._patrol_cards[device.device_id] = card
             self.patrol_grid.addWidget(card, index // 4, index % 4)
         self.patrol_grid.setRowStretch((len(self._snapshot.devices) + 3) // 4, 1)
@@ -1289,6 +1372,7 @@ class TeacherMainWindow(QMainWindow):
             name.setAutoFillBackground(True)
             name.copy_requested.connect(self._copy_device_name)
             name.note_requested.connect(self._edit_device_note)
+            name.remove_requested.connect(self._remove_device)
             self.maintenance_table.setCellWidget(row, 0, name)
             self.maintenance_table.setRowHeight(row, max(36, name.sizeHint().height() + 6))
         self._refresh_application_rules()

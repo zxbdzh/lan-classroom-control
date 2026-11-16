@@ -2,6 +2,7 @@ import os
 import base64
 import time
 import threading
+import uuid
 from dataclasses import replace
 from typing import List, Optional, Callable
 from common.protocol import MessageType, build_message, parse_message_type
@@ -225,6 +226,7 @@ class TeacherServer:
         student.status["protocol_version"] = protocol_version
         student.status["capabilities"] = list(params.get("capabilities", []))
         student.status["machine_id"] = machine_id
+        student.status["registration_id"] = uuid.uuid4().hex
         self.student_manager.add_student(student)
         self.heartbeat_manager.register_student(student_id)
         logger.info(f"Student registered: {hostname} ({ip}) [{mac}]")
@@ -348,6 +350,7 @@ class TeacherServer:
             group=student.group,
             online=student.online,
             last_seen=student.last_heartbeat,
+            registration_id=str(student.status.get("registration_id", "")),
             metadata={
                 "ip": student.ip,
                 "mac": student.mac,

@@ -62,6 +62,10 @@ def stylesheet(theme: str = "light") -> str:
     QTabWidget#ApplicationTabs QTabBar::tab:selected { background: %(panel)s; color: %(primary)s;
         border-bottom: 2px solid %(primary)s; font-weight: 600; }
     QCheckBox { color: %(ink)s; spacing: 6px; background: transparent; }
+    QMenu { background: %(panel)s; color: %(ink)s; border: 1px solid %(line)s; padding: 4px; }
+    QMenu::item { padding: 6px 14px; }
+    QMenu::item:selected { background: %(panel_alt)s; color: %(ink)s; }
+    QMenu::separator { background: %(line)s; height: 1px; margin: 4px 6px; }
     QPushButton#NavButton { border: 0; border-radius: 4px; text-align: left;
         padding-left: 14px; min-height: 42px; color: %(muted)s; background: transparent; }
     QPushButton#NavButton:hover { color: %(ink)s; background: %(panel_alt)s; }

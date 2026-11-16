@@ -71,6 +71,7 @@ class TransportDevice:
     online: bool = True
     last_seen: float = 0.0
     metadata: Mapping[str, Any] = None
+    registration_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.device_id:
@@ -195,6 +196,7 @@ class InMemoryTransport:
             online=True,
             last_seen=self._clock.now(),
             metadata=dict(metadata or {}),
+            registration_id=uuid.uuid4().hex,
         )
         with self._lock:
             self._devices[device_id] = device
@@ -216,6 +218,7 @@ class InMemoryTransport:
                 online=False,
                 last_seen=old.last_seen,
                 metadata=old.metadata,
+                registration_id=old.registration_id,
             )
             self._devices[device_id] = device
         if self._device_handler is not None:
@@ -353,7 +356,7 @@ class Classroom:
                 return None
             devices = tuple(
                 self._device_snapshot(device_id) for device_id in sorted(self._devices)
-                if not self._devices[device_id].get("metadata", {}).get("identity_alias_of")
+                if self._device_is_listed(self._devices[device_id])
             )
             operations = tuple(
                 self._receipt(command_id)
@@ -509,6 +512,34 @@ class Classroom:
             self._bump_and_persist()
             return True
 
+    @staticmethod
+    def _device_is_listed(device: Mapping[str, Any]) -> bool:
+        return not device.get("removed") and not device.get("metadata", {}).get("identity_alias_of")
+
+    def known_device(self, device_id: str) -> Optional[DeviceSnapshot]:
+        with self._lock:
+            self._ensure_open()
+            canonical_id = self.resolve_device_alias(device_id)
+            return self._device_snapshot(canonical_id) if canonical_id in self._devices else None
+
+    def remove_devices(self, device_ids: List[str], offline_only: bool = False) -> Tuple[str, ...]:
+        with self._lock:
+            self._ensure_open()
+            removed = []
+            for device_id in dict.fromkeys(str(value) for value in device_ids):
+                device = self._devices.get(device_id)
+                if device is None or not self._device_is_listed(device):
+                    continue
+                if offline_only and device.get("online"):
+                    continue
+                # 保留身份、备注和操作历史；只从当前教室与指令目标中移除。
+                device["removed"] = True
+                self._expire_disconnected_temporary_controls(device_id)
+                removed.append(device_id)
+            if removed:
+                self._bump_and_persist()
+            return tuple(removed)
+
     def resolve_device_alias(self, device_id: str) -> str:
         with self._lock:
             current = str(device_id)
@@ -525,7 +556,7 @@ class Classroom:
         if isinstance(scope, All):
             return tuple(sorted(
                 device_id for device_id, device in self._devices.items()
-                if not device.get("metadata", {}).get("identity_alias_of")
+                if self._device_is_listed(device)
             ))
         if isinstance(scope, Group):
             return tuple(
@@ -533,7 +564,7 @@ class Classroom:
                     device_id
                     for device_id, device in self._devices.items()
                     if device.get("group", "default") == scope.name
-                    and not device.get("metadata", {}).get("identity_alias_of")
+                    and self._device_is_listed(device)
                 )
             )
         if isinstance(scope, DeviceIds):
@@ -549,8 +580,9 @@ class Classroom:
                     },
                 )
             return tuple(dict.fromkeys(
-                self.resolve_device_alias(device_id)
-                for device_id in scope.device_ids
+                canonical_id for canonical_id in (
+                    self.resolve_device_alias(device_id) for device_id in scope.device_ids
+                ) if self._device_is_listed(self._devices[canonical_id])
             ))
         raise TypeError("unknown target scope")
 
@@ -610,6 +642,10 @@ class Classroom:
         with self._lock:
             operation = self._operations.get(command_id)
             if operation is None:
+                return
+            if (not self._device_is_listed(self._devices.get(device_id, {}))
+                    and operation["action"]["kind"] != CommandKind.RESTORE_ALL.value):
+                # 保留永久配置用于重新注册后同步，列表移除期间不继续重试旧指令。
                 return
             status = operation["statuses"].get(device_id)
             if status is None or status["state"] != DeviceCommandState.SENT.value:
@@ -769,9 +805,14 @@ class Classroom:
 
     def _on_device(self, device: TransportDevice) -> None:
         with self._lock:
-            was_online = bool(self._devices.get(device.device_id, {}).get("online", False))
+            previous = self._devices.get(device.device_id, {})
+            was_online = bool(previous.get("online", False))
+            was_removed = bool(previous.get("removed"))
             self._merge_device(device, notify=False)
-            if device.online and not was_online:
+            if not self._device_is_listed(self._devices[device.device_id]):
+                self._bump_and_persist()
+                return
+            if device.online and (not was_online or was_removed):
                 self._sync_permanent(device.device_id)
                 self._sync_global_blacklist(device.device_id)
             elif was_online and not device.online:
@@ -812,6 +853,9 @@ class Classroom:
         metadata = dict(device.metadata or {})
         if not metadata.get("machine_id") and previous.get("metadata", {}).get("machine_id"):
             metadata["machine_id"] = previous["metadata"]["machine_id"]
+        new_registration = bool(
+            device.registration_id and device.registration_id != previous.get("registration_id")
+        )
         self._devices[device.device_id] = {
             "hostname": device.hostname,
             "note": str(previous.get("note", "")),
@@ -819,6 +863,9 @@ class Classroom:
             "online": bool(device.online),
             "last_seen": float(device.last_seen or self._clock.now()),
             "metadata": metadata,
+            "registration_id": device.registration_id or previous.get("registration_id", ""),
+            # 刷新、旧连接断开及重启读回不能复活记录，只有真正的新注册可以重新加入。
+            "removed": bool(previous.get("removed")) and not (device.online and new_registration),
         }
         if notify:
             self._bump_and_persist()
@@ -831,12 +878,12 @@ class Classroom:
                 return ()
             metadata = canonical.get("metadata", {})
             mac = normalize_mac(metadata.get("mac"))
-            if not mac or metadata.get("identity_alias_of"):
+            if not mac or not self._device_is_listed(canonical):
                 return ()
             consolidated = []
             for device_id, device in self._devices.items():
                 other = device.get("metadata", {})
-                if device_id == canonical_id or device.get("online") or other.get("identity_alias_of"):
+                if device_id == canonical_id or device.get("online") or not self._device_is_listed(device):
                     continue
                 if normalize_mac(other.get("mac")) != mac or device.get("hostname") != canonical.get("hostname"):
                     continue
@@ -864,7 +911,7 @@ class Classroom:
 
     def _sync_global_blacklist(self, device_id: str) -> None:
         device = self._devices.get(device_id, {})
-        if device.get("metadata", {}).get("identity_alias_of"):
+        if not self._device_is_listed(device):
             return
         for program in tuple(self._global_blacklist):
             desired = self._desired.get(device_id, {}).get("blacklist:" + program)
@@ -878,6 +925,8 @@ class Classroom:
             ), DeviceIds([device_id]))
 
     def _sync_permanent(self, device_id: str) -> None:
+        if not self._device_is_listed(self._devices.get(device_id, {})):
+            return
         for domain, desired in self._desired.get(device_id, {}).items():
             if not desired.get("permanent", False):
                 continue
@@ -958,7 +1007,7 @@ class Classroom:
             hostname=str(device.get("hostname", device_id)),
             note=str(device.get("note", "")),
             group=str(device.get("group", "default")),
-            online=bool(device.get("online", False)),
+            online=bool(device.get("online", False)) and not device.get("removed", False),
             last_seen=float(device.get("last_seen", 0.0)),
             metadata=dict(device.get("metadata", {})),
             expected=self._state_values(self._desired.get(device_id, {})),

@@ -357,6 +357,19 @@ class TeacherRuntime:
     ) -> OperationReceipt:
         return self.classroom.set_blacklist(scope, program, path, enabled)
 
+    def remove_devices(self, device_ids: Iterable[str], offline_only: bool = False) -> Tuple[str, ...]:
+        requested = set(str(value) for value in device_ids)
+        targets = tuple(
+            device.device_id for device in self.snapshot().devices
+            if device.device_id in requested and (not offline_only or not device.online)
+        )
+        if not targets:
+            return ()
+        # 先退出当前媒体与临时控制，避免列表消失后学生仍被黑屏或锁定。
+        self._remote_inspection.difference_update(targets)
+        self.restore_all(DeviceIds(targets))
+        return self.classroom.remove_devices(list(targets), offline_only=offline_only)
+
     def set_device_note(self, device_id: str, note: str) -> bool:
         return self.classroom.set_device_note(device_id, note)
 
@@ -371,7 +384,7 @@ class TeacherRuntime:
         snapshot = self.classroom.snapshot()
         normalized_mac = normalize_mac(mac)
         machine_id = str(machine_id or "").strip()
-        direct = snapshot.device(self.classroom.resolve_device_alias(str(device_id)))
+        direct = self.classroom.known_device(str(device_id))
         if direct is not None and machine_id:
             if direct.metadata.get("machine_id") == machine_id:
                 self.classroom.consolidate_duplicate_devices(direct.device_id)

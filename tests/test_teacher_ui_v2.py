@@ -476,6 +476,7 @@ def test_device_name_copy_and_note_controls_are_per_device_and_update_views(
     window = file_drop_window
     window.runtime.server.connect("pc-02", "PC-01")
     window._poll_runtime()
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     window._show_page(surface)
 
     def device_name_widget():
