@@ -16,6 +16,7 @@ from teacher.core.student_manager import StudentManager, StudentInfo
 from teacher.core.screen_broadcast import ScreenBroadcaster
 from teacher.core.file_distributor import FileDistributor
 from teacher.core.update_server import UpdateServer
+from common.update_security import UpdateVerificationError
 
 logger = get_logger("teacher_core")
 
@@ -524,7 +525,7 @@ class TeacherServer:
             target_dir_path=target_dir_path
         )
 
-    def push_update(self, file_path: str, version: str,
+    def push_update(self, file_path: str, version: Optional[str] = None,
                     student_ids: Optional[List[str]] = None) -> int:
         """设置更新包并向学生端通知有新版本。
 
@@ -536,7 +537,8 @@ class TeacherServer:
         Returns: 通知到的学生数量
         """
         if not self.update_server.set_update_package(file_path, version):
-            return 0
+            # 签名失败与零在线设备必须分开，不能让管理员误判连接状态。
+            raise UpdateVerificationError(self.update_server.last_error)
         return self.update_server.notify_update(student_ids)
 
     def get_update_progress(self) -> dict:

@@ -1229,12 +1229,13 @@ class TeacherMainWindow(QMainWindow):
         if not path:
             return
         try:
-            with open(path + ".manifest.json", "r", encoding="utf-8") as handle:
-                version = str(json.load(handle)["version"])
-            target_ids = self._resolve_scope_ids(self._current_scope())
-            count = self.runtime.server.push_update(path, version, target_ids)
+            scope = self._current_scope()
+            # 全班由服务端实时解析连接，避免界面快照尚未刷新时误传空列表。
+            target_ids = None if self.scope_buttons["all"].isChecked() else self._resolve_scope_ids(scope)
+            # 版本由服务端从已验签清单读取，UI 不再依赖旁挂文件。
+            count = self.runtime.server.push_update(path, student_ids=target_ids)
             if count <= 0:
-                raise ValueError("更新包签名无效，或当前作用域没有在线设备")
+                raise ValueError("当前作用域没有可通知的在线设备，请检查设备连接或切换作用域")
             self.operation_status.setText(f"更新通知已发送 · {count} 台")
         except Exception as exc:
             QMessageBox.warning(self, "无法部署更新", str(exc))

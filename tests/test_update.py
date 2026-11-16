@@ -248,17 +248,19 @@ class TestUpdateServer:
         self.update_zip = os.path.join(self.tmp_dir, "update.zip")
         with zipfile.ZipFile(self.update_zip, "w") as zf:
             zf.writestr("version.txt", "1.0.8")
+        from Crypto.PublicKey import ECC
+        from common.update_security import build_manifest, sign_manifest
+
+        key = ECC.generate(curve="Ed25519")
+        manifest = build_manifest(self.update_zip, "1.0.8", 1)
         with open(self.update_zip + ".manifest.json", "wb") as handle:
-            handle.write(b"{}")
+            handle.write(manifest)
         with open(self.update_zip + ".sig", "w", encoding="ascii") as handle:
-            handle.write("test-signature")
-        self.verify_patcher = patch(
-            "teacher.core.update_server.verify_manifest", return_value={}
-        )
+            handle.write(sign_manifest(manifest, key.export_key(format="PEM").encode("ascii")))
         self.key_patcher = patch(
-            "teacher.core.update_server.load_public_key", return_value=b"test-key"
+            "teacher.core.update_server.load_public_key",
+            return_value=key.public_key().export_key(format="PEM").encode("ascii"),
         )
-        self.verify_patcher.start()
         self.key_patcher.start()
 
         self.student_manager = MagicMock()
@@ -266,7 +268,6 @@ class TestUpdateServer:
         self.file_distributor.send_file_to_students.return_value = "transfer_id_1"
 
     def teardown_method(self):
-        self.verify_patcher.stop()
         self.key_patcher.stop()
         if os.path.exists(self.tmp_dir):
             shutil.rmtree(self.tmp_dir)

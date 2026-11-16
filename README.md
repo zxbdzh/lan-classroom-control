@@ -13,7 +13,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8-3776ab?logo=python&logoColor=white)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15.2-41cd52)
 ![Platform](https://img.shields.io/badge/Windows-7%20SP1%20%7C%2010%20x64-0078d4?logo=windows&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97533-f2a1c1)
+![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97556-f2a1c1)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
@@ -98,6 +98,13 @@ USB 限制属于临时课堂控制：断线、心跳租约过期、点击“恢�
 本版本按项目决策采用自动发现、自动连接、无身份认证和明文控制通道。任何能进入同一局域网并访问端口的主机都可能伪装教师或观察/篡改流量。系统只能部署在隔离且受信任的教学 VLAN，禁止映射到公网。
 
 发布更新包必须同时具备 SHA-256 和 Ed25519 清单签名。发布私钥不得提交到仓库；仓库只包含学生端信任的公钥。
+
+### 部署学生端更新
+
+- 下载 `LanClassroom-Student-Update.zip`，在教师端“设备维护 → 部署签名更新”直接选择该文件，无需解压或另外下载清单、签名。
+- 新更新包需要先安装支持单文件更新包的教师端；旧学生端仍接收原始已签名载荷，不需要先更换学生端才能接收更新。教师端更新请使用教师端安装器。
+- 仍兼容旧式三文件：`LanClassroom-Student.zip`、`LanClassroom-Student.zip.manifest.json`、`LanClassroom-Student.zip.sig` 必须位于同一目录，选择其中的 ZIP。
+- “全部”以服务端当前在线连接为准；“选中”和“分组”只通知对应设备。验签失败与没有可通知的在线设备分别提示，不再合并为同一错误。
 
 ## 测试
 

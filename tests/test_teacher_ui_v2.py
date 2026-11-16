@@ -18,6 +18,34 @@ from teacher.ui.widgets import DeviceNameWidget, EmptySeat, FullScreenViewer, Se
 from student.ui.overlay import OverlayWindow
 
 
+@pytest.mark.parametrize("count,error,expected", [
+    (2, None, None),
+    (0, None, "当前作用域没有可通知的在线设备"),
+    (None, ValueError("更新包签名校验失败：invalid Ed25519 update signature"), "更新包签名校验失败"),
+])
+def test_update_dialog_uses_single_zip_and_preserves_failure_reason(
+    file_drop_window, tmp_path, count, error, expected,
+):
+    window = file_drop_window
+    path = str(tmp_path / "LanClassroom-Student-Update.zip")
+    window.runtime.server.push_update = MagicMock(return_value=count, side_effect=error)
+    window._selected_ids = {"pc-01"}
+    window.scope_buttons["selected"].setChecked(True)
+    with patch("teacher.ui.main_window.QFileDialog.getOpenFileName", return_value=(path, "")), \
+            patch("teacher.ui.main_window.QMessageBox.warning") as warning:
+        window._push_update()
+    # 只有 ZIP 路径也应进入服务端，不应由 UI 强制读取外部 manifest。
+    window.runtime.server.push_update.assert_called_once_with(path, student_ids=["pc-01"])
+    if expected is None:
+        warning.assert_not_called()
+        assert "2 台" in window.operation_status.text()
+    else:
+        warning.assert_called_once()
+        assert expected in warning.call_args.args[2]
+        if count == 0:
+            assert "签名" not in warning.call_args.args[2]
+
+
 @pytest.fixture
 def file_drop_window(qtbot):
     transport = InMemoryTransport()
@@ -697,3 +725,15 @@ def test_application_control_switch_failure_reverts_visual_state(file_drop_windo
     assert window.application_control_switch.isChecked()
     assert window.runtime.snapshot().application_control_enabled is True
     assert "保存失败" in window.application_feedback.text()
+
+
+def test_update_all_uses_live_connections_not_a_stale_ui_snapshot(file_drop_window, tmp_path):
+    window = file_drop_window
+    path = str(tmp_path / "LanClassroom-Student-Update.zip")
+    window.runtime.server.push_update = MagicMock(return_value=2)
+    window.scope_buttons["all"].setChecked(True)
+    window._snapshot = None
+    with patch("teacher.ui.main_window.QFileDialog.getOpenFileName", return_value=(path, "")),             patch("teacher.ui.main_window.QMessageBox.warning") as warning:
+        window._push_update()
+    window.runtime.server.push_update.assert_called_once_with(path, student_ids=None)
+    warning.assert_not_called()

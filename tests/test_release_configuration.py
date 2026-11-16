@@ -45,6 +45,21 @@ def test_release_signing_always_removes_temporary_private_key() -> None:
     assert "Remove-Item -LiteralPath $keyPath -Force" in signing_step
 
 
+def test_release_publishes_self_contained_update_bundles() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    assets = workflow.split("$assets = @(", 1)[1].split(")", 1)[0]
+    for role in ("Teacher", "Student"):
+        name = f"LanClassroom-{role}"
+        assert f"bundle --package {name}.zip --output {name}-Update.zip" in workflow
+        assert f'"{name}-Update.zip"' in assets
+        assert f'"{name}.zip"' not in assets
+        assert f"{name}.zip.manifest.json" not in assets
+        assert f"{name}.zip.sig" not in assets
+    assert "SHA256 LanClassroom-Teacher-Update.zip,LanClassroom-Student-Update.zip" in workflow
+
+
 def test_student_installer_updates_an_existing_service() -> None:
     installer = (ROOT / "installer" / "student.iss").read_text(encoding="utf-8")
 

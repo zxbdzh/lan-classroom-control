@@ -7,7 +7,8 @@ from typing import Callable, Dict, List, Optional
 from common.protocol import MessageType, build_message
 from common.file_transfer import CHUNK_SIZE
 from common.logger import get_logger
-from common.update_security import load_public_key, sha256_file, verify_manifest
+from common.update_security import load_public_key
+from common.update_bundle import open_update_package
 
 logger = get_logger("update_server")
 
@@ -33,6 +34,9 @@ class UpdateServer:
         self.update_sha256: Optional[str] = None
         self.update_manifest: Optional[bytes] = None
         self.update_signature: Optional[str] = None
+        self.last_error: str = ""
+        self._package = None
+        self._retired_packages = []
         # 各学生端更新进度: {student_id: {"progress": float, "status": str, "last_update": float}}
         self._progress: Dict[str, dict] = {}
         # 已请求但未完成的学生集合
@@ -41,40 +45,41 @@ class UpdateServer:
     # ------------------------------------------------------------------
     # 设置更新包
     # ------------------------------------------------------------------
-    def set_update_package(self, file_path: str, version: str) -> bool:
-        """设置待推送的更新包，计算 MD5。"""
-        if not os.path.isfile(file_path):
-            logger.error(f"Update package not found: {file_path}")
-            return False
+    def set_update_package(self, file_path: str, version: Optional[str] = None) -> bool:
+        """验证并加载更新包；版本仅从验签后的清单获取。"""
+        package = None
         try:
-            md5 = self._compute_file_md5(file_path)
-            sha256 = sha256_file(file_path)
-            with open(file_path + ".manifest.json", "rb") as handle:
-                manifest = handle.read()
-            with open(file_path + ".sig", "rt", encoding="ascii") as handle:
-                signature = handle.read().strip()
-            verify_manifest(
-                manifest,
-                signature,
-                load_public_key(),
-                package_path=file_path,
-                expected_version=version,
-            )
-        except Exception as e:
-            logger.error(f"Update package signature verification failed: {e}")
+            package = open_update_package(file_path, load_public_key(), version)
+            md5 = self._compute_file_md5(package.path)
+        except Exception as exc:
+            if package is not None:
+                package.close()
+            self.last_error = f"更新包签名校验失败：{exc}"
+            # 保留底层异常链，现场缺 DLL 或文件损坏不能只留下泛化的签名错误。
+            logger.exception(self.last_error)
             return False
         with self._lock:
-            self.update_file_path = file_path
-            self.update_version = version
+            previous = self._package
+            # 文件分发在后台读包，切包时保留旧载荷，避免传输中途被删除。
+            if previous is not None:
+                self._retired_packages.append(previous)
+            self._package = package
+            self.last_error = ""
+            self.update_file_path = package.path
+            self.update_version = str(package.metadata["version"])
             self.update_md5 = md5
-            self.update_sha256 = sha256
-            self.update_manifest = manifest
-            self.update_signature = signature
-        logger.info(f"Update package set: {file_path}, version={version}, sha256={sha256}")
+            self.update_sha256 = str(package.metadata["sha256"])
+            self.update_manifest = package.manifest
+            self.update_signature = package.signature
+        logger.info(f"Update package set: {file_path}, version={self.update_version}")
         return True
 
     def clear_update_package(self):
         with self._lock:
+            packages = self._retired_packages + ([self._package] if self._package else [])
+            self._retired_packages = []
+            self._package = None
+            self.last_error = ""
             self.update_file_path = None
             self.update_version = None
             self.update_md5 = None
@@ -83,6 +88,8 @@ class UpdateServer:
             self.update_signature = None
             self._progress.clear()
             self._pending.clear()
+        for package in packages:
+            package.close()
         logger.info("Update package cleared")
 
     # ------------------------------------------------------------------
@@ -112,7 +119,9 @@ class UpdateServer:
         for student in students:
             if student.conn and student.conn.is_alive():
                 try:
-                    student.conn.send_message(msg)
+                    if not student.conn.send_message(msg):
+                        logger.warning(f"Notify update to {student.hostname} failed: connection send failed")
+                        continue
                     count += 1
                     with self._lock:
                         if student.student_id not in self._progress:

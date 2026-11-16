@@ -108,7 +108,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Teacher manifest signing failed with exit code $LASTEXITCODE" }
             uv run --locked python scripts/release_manifest.py sign --package LanClassroom-Student.zip --version $version --private $keyPath
             if ($LASTEXITCODE -ne 0) { throw "Student manifest signing failed with exit code $LASTEXITCODE" }
-            Get-FileHash -Algorithm SHA256 LanClassroom-Teacher.zip,LanClassroom-Student.zip,dist/installer/*.exe | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content SHA256SUMS.txt
+            # 外层 ZIP 同时携带原始载荷、清单和签名，旧学生端仍接收原始载荷。
+            uv run --locked python scripts/release_manifest.py bundle --package LanClassroom-Teacher.zip --output LanClassroom-Teacher-Update.zip
+            if ($LASTEXITCODE -ne 0) { throw "Teacher update bundle verification failed" }
+            uv run --locked python scripts/release_manifest.py bundle --package LanClassroom-Student.zip --output LanClassroom-Student-Update.zip
+            if ($LASTEXITCODE -ne 0) { throw "Student update bundle verification failed" }
+            Get-FileHash -Algorithm SHA256 LanClassroom-Teacher-Update.zip,LanClassroom-Student-Update.zip,dist/installer/*.exe | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content SHA256SUMS.txt
           }
           finally {
             Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
@@ -120,12 +125,8 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $assets = @(
-            "LanClassroom-Teacher.zip"
-            "LanClassroom-Teacher.zip.manifest.json"
-            "LanClassroom-Teacher.zip.sig"
-            "LanClassroom-Student.zip"
-            "LanClassroom-Student.zip.manifest.json"
-            "LanClassroom-Student.zip.sig"
+            "LanClassroom-Teacher-Update.zip"
+            "LanClassroom-Student-Update.zip"
             "dist/installer/LanClassroom-Teacher-Setup.exe"
             "dist/installer/LanClassroom-Student-Setup.exe"
             "SHA256SUMS.txt"

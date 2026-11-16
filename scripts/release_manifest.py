@@ -8,7 +8,8 @@ import time
 
 from Crypto.PublicKey import ECC
 
-from common.update_security import build_manifest, sign_manifest, verify_manifest
+from common.update_security import build_manifest, load_public_key, sign_manifest, verify_manifest
+from common.update_bundle import build_update_bundle
 
 
 def main() -> None:
@@ -26,7 +27,15 @@ def main() -> None:
     verify.add_argument("--manifest", required=True)
     verify.add_argument("--signature", required=True)
     verify.add_argument("--public", required=True)
+    bundle = subparsers.add_parser("bundle")
+    bundle.add_argument("--package", required=True)
+    bundle.add_argument("--output", required=True)
+    bundle.add_argument("--public")
     args = parser.parse_args()
+
+    if args.command == "bundle":
+        build_update_bundle(args.package, args.output, load_public_key(args.public))
+        return
 
     if args.command == "keygen":
         key = ECC.generate(curve="Ed25519")
