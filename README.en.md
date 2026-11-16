@@ -13,7 +13,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8-3776ab?logo=python&logoColor=white)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15.2-41cd52)
 ![Platform](https://img.shields.io/badge/Windows-7%20SP1%20%7C%2010%20x64-0078d4?logo=windows&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97533-f2a1c1)
+![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97570-f2a1c1)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
@@ -24,6 +24,7 @@
 
 - **Seat map**: initial placement by hostname suffix; drag, empty seats, row/column settings, and whole-class / group / selected scopes
 - **Device labels**: click a device name to copy it; persistent, searchable notes distinguish machines with identical hostnames
+- **Device cleanup**: remove devices from seat/patrol card menus, remove selected devices in bulk, or clear offline records under Device maintenance. Notes, groups, permanent app rules and operation history remain available; students reappear when they reconnect, without reinstalling the student client
 - **Screen broadcasting**: 20 FPS MJPEG over UDP multicast; falls back to a dedicated TCP media channel if no first frame arrives within 800ms; student keyboard/mouse can be locked during broadcast
 - **Patrol & remote control**: 640×360 / 1 FPS thumbnails on the main screen; focus and remote control at 720p / 15 FPS; UDP uplink with a bounded single-slot TCP backup; fullscreen view
 - **Blackout**: covers all student displays, shows a teacher message, locks keyboard/mouse

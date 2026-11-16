@@ -1,7 +1,7 @@
 #define AppName "LanClassroom Student"
 #define AppNameZh "局域网机房控制系统学生端"
 #ifndef AppVersion
-  #define AppVersion "2.1.1"
+  #define AppVersion "2.1.3"
 #endif
 #define AppPublisher "LanClassroom"
 #define ServiceExe "LanClassroom-Student-Service.exe"

@@ -13,7 +13,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8-3776ab?logo=python&logoColor=white)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.15.2-41cd52)
 ![Platform](https://img.shields.io/badge/Windows-7%20SP1%20%7C%2010%20x64-0078d4?logo=windows&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97556-f2a1c1)
+![Tests](https://img.shields.io/badge/tests-pytest%20%C3%97570-f2a1c1)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
@@ -24,6 +24,7 @@
 
 - 座位图：按主机名尾号初排，支持拖动、空座、行列设置和全班/分组/已选作用域。
 - 设备标记：点击设备名复制完整名称，支持持久备注及按备注搜索；同名设备可分别标记。
+- 设备整理：右键教室、巡视卡片可移除设备；设备维护页支持批量移除和清理离线记录。保留备注、分组、永久应用规则和历史操作；不卸载学生端，学生再次连接后重新加入。
 - 屏幕广播：20 FPS MJPEG UDP 组播，800ms 未收到首帧时使用独立 TCP 媒体通道降级；广播期间可锁定学生键鼠。
 - 巡视与远控：主屏缩略图默认 640×360 / 1 FPS，巡视只发送一份 TCP 画面；远控通过随包附带的 UltraVNC 独立窗口运行。
 - 黑屏肃静：显示教师提示语并限制键鼠；远控时临时让出该台屏幕，退出后按仍有效的课堂状态恢复。
