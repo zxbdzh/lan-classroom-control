@@ -207,6 +207,7 @@ class DeviceSnapshot:
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     expected: Tuple[StateValue, ...] = ()
     actual: Tuple[StateValue, ...] = ()
+    note: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _frozen_mapping(self.metadata))
@@ -224,6 +225,14 @@ class ClassroomSnapshot:
     devices: Tuple[DeviceSnapshot, ...]
     operations: Tuple[OperationReceipt, ...]
     observed_at: float
+    global_blacklist: Tuple[str, ...] = ()
+    application_control_enabled: bool = True
+    local_blacklist_rules: Mapping[str, Tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "local_blacklist_rules", MappingProxyType({
+            identity: tuple(device_ids) for identity, device_ids in self.local_blacklist_rules.items()
+        }))
 
     def device(self, device_id: str) -> Optional[DeviceSnapshot]:
         return next((device for device in self.devices if device.device_id == device_id), None)

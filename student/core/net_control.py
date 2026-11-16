@@ -51,7 +51,8 @@ class NetController:
     def _block_internet(self, whitelist_ips: Optional[List[str]] = None) -> bool:
         with self._lock:
             requested = list(whitelist_ips or [])
-            if self._blocked and requested == self._whitelist_ips:
+            # Windows 规则可能被系统或其他软件清理，重复下发必须重新检查并应用。
+            if sys.platform != "win32" and self._blocked and requested == self._whitelist_ips:
                 return True
             self._whitelist_ips = requested
         self.last_error = ""
@@ -134,15 +135,17 @@ class NetController:
                     )
                     if not enabled:
                         raise RuntimeError("请先启用 Windows 防火墙的全部网络配置")
-                self._remove_policy_rules(policy)
                 allowed = self._allowed_networks(self._whitelist_ips)
                 ranges = self._external_networks(allowed)
+                self._remove_policy_rules(policy)
                 # 阻断规则优先于允许规则，因此只阻断白名单的补集，保留教师连接。
                 for version in (4, 6):
                     networks = [
                         value for value in ranges
                         if ipaddress.ip_network(value).version == version
                     ]
+                    if not networks:
+                        raise ValueError("禁网白名单不能覆盖全部 IPv4 或 IPv6 地址")
                     for index, remote_ips in enumerate(self._chunk_remote_ips(networks)):
                         rule = dispatch("HNetCfg.FWRule")
                         rule.Name = f"{RULE_NAME_PREFIX}_BlockExternal_{version}_{index}"
@@ -232,7 +235,9 @@ class NetController:
                 if text not in normalized:
                     normalized.append(text)
             except ValueError:
-                logger.warning(f"Ignore invalid allowed network: {value}")
+                raise ValueError(f"禁网白名单必须是有效的 IP 或 CIDR 网段：{value}")
+            if network.prefixlen == 0:
+                raise ValueError("禁网白名单不能填写 0.0.0.0/0 或 ::/0，否则会放行全部外网")
         return normalized
 
     @staticmethod

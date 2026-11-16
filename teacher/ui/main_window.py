@@ -10,11 +10,12 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from PyQt5.QtCore import QObject, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QCloseEvent
+from PyQt5.QtGui import QCloseEvent, QPalette
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -35,11 +36,13 @@ from PyQt5.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from common.config import get_config
+from common.application_policy import normalize_program_name
 from common.logger import get_logger
 from common.version import get_version
 from common.v2.model import (
@@ -52,10 +55,13 @@ from common.v2.model import (
 from teacher.core.runtime import TeacherRuntime
 from teacher.ui.theme import stylesheet
 from teacher.ui.widgets import (
+    DeviceNameWidget,
+    FileDropTable,
     FullScreenViewer,
     OperationDrawer,
     PatrolCard,
     SeatMapWidget,
+    ToggleSwitch,
 )
 
 logger = get_logger("teacher_ui")
@@ -91,6 +97,8 @@ class TeacherMainWindow(QMainWindow):
         self._viewers: Dict[str, FullScreenViewer] = {}
         self._file_rows: Dict[str, int] = {}
         self._process_command_id = None
+        self._processes: List[dict] = []
+        self._network_command_id = None
         self._active_page = "classroom"
         self.bridge = UiBridge()
 
@@ -254,7 +262,7 @@ class TeacherMainWindow(QMainWindow):
 
     def _build_classroom_page(self) -> QWidget:
         search = QLineEdit()
-        search.setPlaceholderText("搜索主机名或 IP")
+        search.setPlaceholderText("搜索主机名、备注或 IP")
         search.setFixedWidth(240)
         search.textChanged.connect(self._refresh_devices)
         actions = QWidget()
@@ -271,6 +279,8 @@ class TeacherMainWindow(QMainWindow):
         )
         self.seat_map.selection_changed.connect(self._selection_changed)
         self.seat_map.positions_changed.connect(self._save_seat_positions)
+        self.seat_map.copy_requested.connect(self._copy_device_name)
+        self.seat_map.note_requested.connect(self._edit_device_note)
         self.classroom_search = search
         layout.addWidget(self.seat_map, 1)
         return page
@@ -312,42 +322,159 @@ class TeacherMainWindow(QMainWindow):
         row.addWidget(add_folder)
         row.addWidget(send)
         page, layout = self._page_shell("文件", actions)
-        self.file_table = self._table(("名称", "类型", "大小", "进度", "状态"))
+        self.file_table = self._table(("名称", "类型", "大小", "进度", "状态"), FileDropTable)
+        self.file_table.paths_dropped.connect(self._queue_paths)
+        self.file_table.setToolTip("拖入文件或文件夹加入列表，再点击“开始分发”发送")
         layout.addWidget(self.file_table, 1)
-        self.file_hint = QLabel("接收位置：桌面 / 课堂文件")
+        self.file_hint = QLabel("拖入文件或文件夹加入列表，点击“开始分发”发送 · 接收位置：桌面 / 课堂文件")
+        self.file_hint.setWordWrap(True)
         self.file_hint.setProperty("muted", True)
         layout.addWidget(self.file_hint)
         self.file_queue: List[dict] = []
         return page
 
     def _build_policy_page(self) -> QWidget:
-        device_bar = QWidget()
-        row = QHBoxLayout(device_bar)
-        row.setContentsMargins(0, 0, 0, 0)
+        controls = QWidget()
+        control_layout = QHBoxLayout(controls)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.addWidget(QLabel("软件禁用"))
+        self.application_control_status = QLabel("已开启")
+        self.application_control_status.setProperty("muted", True)
+        control_layout.addWidget(self.application_control_status)
+        self.application_control_switch = ToggleSwitch()
+        self.application_control_switch.setAccessibleName("软件禁用总开关")
+        self.application_control_switch.setToolTip("关闭后暂停全部软件限制，规则保留；重新开启可恢复")
+        self.application_control_switch.setChecked(True)
+        self.application_control_switch.toggled.connect(self._toggle_application_control)
+        control_layout.addWidget(self.application_control_switch)
+        page, layout = self._page_shell("应用策略", controls)
+        self.policy_tabs = QTabWidget()
+        self.policy_tabs.setObjectName("ApplicationTabs")
+        rules_page = QWidget()
+        rules_layout = QVBoxLayout(rules_page)
+        rules_layout.setContentsMargins(16, 16, 16, 16)
+        rules_layout.setSpacing(12)
+        composer = QFrame()
+        composer.setObjectName("ApplicationComposer")
+        composer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(14, 12, 14, 12)
+        title = QLabel("禁止软件运行")
+        title.setObjectName("SectionTitle")
+        composer_layout.addWidget(title)
+        hint = QLabel("填写程序名即可禁用，无需先找某台电脑的进程；不同安装位置同样生效。")
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        composer_layout.addWidget(hint)
+        form = QHBoxLayout()
+        form.setSpacing(8)
+        self.application_program = QLineEdit()
+        self.application_program.setPlaceholderText("程序名，例如 chrome.exe、msedge.exe")
+        self.application_program.setClearButtonEnabled(True)
+        self.application_program.setMinimumWidth(140)
+        self.application_scope = QComboBox()
+        self.application_scope.addItem("全班 · 包含新设备", "global")
+        self.application_scope.addItem("仅当前作用域", "scope")
+        self.application_block_button = QPushButton("全班禁用")
+        self.application_block_button.setProperty("primary", True)
+        self.application_block_button.setEnabled(False)
+        self.application_block_button.clicked.connect(self._apply_application_rule)
+        self.application_program.textChanged.connect(
+            lambda text: self.application_block_button.setEnabled(bool(text.strip()))
+        )
+        self.application_scope.currentIndexChanged.connect(self._application_scope_changed)
+        form.addWidget(self.application_program, 1)
+        form.addWidget(self.application_scope)
+        form.addWidget(self.application_block_button)
+        composer_layout.addLayout(form)
+        self.application_feedback = QLabel("全班规则持续生效，离线设备上线后补发，新加入的设备自动继承。")
+        self.application_feedback.setProperty("muted", True)
+        self.application_feedback.setWordWrap(True)
+        composer_layout.addWidget(self.application_feedback)
+        rules_layout.addWidget(composer)
+        rules_header = QHBoxLayout()
+        self.application_rule_count = QLabel("禁用规则")
+        self.application_rule_count.setObjectName("SectionTitle")
+        self.application_rule_search = QLineEdit()
+        self.application_rule_search.setPlaceholderText("搜索禁用规则")
+        self.application_rule_search.setMaximumWidth(220)
+        self.application_rule_search.setClearButtonEnabled(True)
+        self.application_rule_search.textChanged.connect(self._refresh_application_rules)
+        rules_header.addWidget(self.application_rule_count)
+        rules_header.addStretch()
+        rules_header.addWidget(self.application_rule_search)
+        rules_layout.addLayout(rules_header)
+        self.blacklist_table = self._table(("程序", "禁用范围", "执行情况", "操作"))
+        self.blacklist_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        for column, width in ((0, 165), (1, 170), (3, 82)):
+            self.blacklist_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.Interactive)
+            self.blacklist_table.setColumnWidth(column, width)
+        self.application_empty = QLabel("尚未添加禁用规则。在上方输入程序名，或从“进程管理”选择软件。")
+        self.application_empty.setProperty("muted", True)
+        self.application_empty.setWordWrap(True)
+        self.application_rules_stack = QStackedWidget()
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(0, 12, 0, 0)
+        empty_layout.addWidget(self.application_empty)
+        empty_layout.addStretch()
+        self.application_rules_stack.addWidget(self.blacklist_table)
+        self.application_rules_stack.addWidget(empty_page)
+        self.application_rules_stack.setCurrentIndex(1)
+        rules_layout.addWidget(self.application_rules_stack, 1)
+        self.policy_tabs.addTab(rules_page, "禁用规则")
+
+        processes_page = QWidget()
+        processes_layout = QVBoxLayout(processes_page)
+        processes_layout.setContentsMargins(16, 16, 16, 16)
+        processes_layout.setSpacing(10)
+        query_row = QHBoxLayout()
+        query_row.addWidget(QLabel("查看设备"))
         self.process_device = QComboBox()
-        self.process_device.setMinimumWidth(180)
+        self.process_device.setMinimumWidth(140)
+        self.process_device.setMaximumWidth(240)
+        self.process_search = QLineEdit()
+        self.process_search.setPlaceholderText("搜索程序名、路径或 PID")
+        self.process_search.setClearButtonEnabled(True)
+        self.process_search.textChanged.connect(self._render_processes)
         refresh = QPushButton("刷新进程")
         refresh.clicked.connect(self._query_processes)
-        terminate = QPushButton("结束进程")
-        terminate.setProperty("danger", True)
-        terminate.clicked.connect(self._terminate_process)
-        add_policy = QPushButton("加入永久黑名单")
-        add_policy.clicked.connect(self._blacklist_selected_process)
-        remove_policy = QPushButton("解除黑名单")
-        remove_policy.clicked.connect(self._remove_blacklist)
-        row.addWidget(self.process_device)
-        row.addWidget(refresh)
-        row.addWidget(terminate)
-        row.addWidget(add_policy)
-        row.addWidget(remove_policy)
-        page, layout = self._page_shell("应用策略", device_bar)
-        self.process_table = self._table(("PID", "进程", "路径", "用户", "保护"))
+        query_row.addWidget(self.process_device)
+        query_row.addWidget(self.process_search, 1)
+        query_row.addWidget(refresh)
+        processes_layout.addLayout(query_row)
+        process_actions = QHBoxLayout()
+        self.show_system_processes = QCheckBox("显示受保护进程")
+        self.show_system_processes.toggled.connect(self._render_processes)
+        self.process_count = QLabel("选择设备后点击“刷新进程”")
+        self.process_count.setProperty("muted", True)
+        self.process_block_button = QPushButton("禁用此软件")
+        self.process_block_button.setProperty("primary", True)
+        self.process_block_button.clicked.connect(self._blacklist_selected_process)
+        self.process_terminate_button = QPushButton("结束所选进程")
+        self.process_terminate_button.setProperty("danger", True)
+        self.process_terminate_button.clicked.connect(self._terminate_process)
+        process_actions.addWidget(self.show_system_processes)
+        process_actions.addWidget(self.process_count)
+        process_actions.addStretch()
+        process_actions.addWidget(self.process_block_button)
+        process_actions.addWidget(self.process_terminate_button)
+        processes_layout.addLayout(process_actions)
+        self.process_table = self._table(("程序", "PID", "安装路径", "运行用户", "状态"))
         self.process_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        for column, width in ((0, 155), (1, 65), (3, 120), (4, 95)):
+            self.process_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.Interactive)
+            self.process_table.setColumnWidth(column, width)
+        self.process_table.itemSelectionChanged.connect(self._process_selection_changed)
         self.process_device.currentIndexChanged.connect(self._process_device_changed)
-        layout.addWidget(self.process_table, 1)
-        self.blacklist_table = self._table(("设备", "程序或路径", "状态"))
-        self.blacklist_table.setMaximumHeight(180)
-        layout.addWidget(self.blacklist_table)
+        processes_layout.addWidget(self.process_table, 1)
+        process_hint = QLabel("“结束所选进程”仅操作当前设备；“禁用此软件”进入规则页，可一次应用到全班。")
+        process_hint.setProperty("muted", True)
+        process_hint.setWordWrap(True)
+        processes_layout.addWidget(process_hint)
+        self.policy_tabs.addTab(processes_page, "进程管理")
+        self._process_selection_changed()
+        layout.addWidget(self.policy_tabs, 1)
         return page
 
     def _build_maintenance_page(self) -> QWidget:
@@ -392,6 +519,8 @@ class TeacherMainWindow(QMainWindow):
         usb_hint.setProperty("muted", True)
         layout.addWidget(usb_hint)
         self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态", "USB 策略"))
+        self.maintenance_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.maintenance_table.setColumnWidth(0, 235)
         layout.addWidget(self.maintenance_table, 1)
         return page
 
@@ -449,8 +578,8 @@ class TeacherMainWindow(QMainWindow):
         return page
 
     @staticmethod
-    def _table(headers) -> QTableWidget:
-        table = QTableWidget(0, len(headers))
+    def _table(headers, table_class=QTableWidget) -> QTableWidget:
+        table = table_class(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -548,7 +677,39 @@ class TeacherMainWindow(QMainWindow):
 
     def _block_network(self) -> None:
         cidrs = [item.strip() for item in self.config.get("teacher.internal_cidrs", []) if item.strip()]
-        self._submit(lambda scope: self.runtime.set_network_blocked(scope, True, cidrs), "外网限制已下发")
+        receipt = self._submit(
+            lambda scope: self.runtime.set_network_blocked(scope, True, cidrs),
+            "外网限制已下发，等待学生确认",
+        )
+        if receipt is not None:
+            self._network_command_id = receipt.command_id
+
+    def _consume_network_result(self, snapshot) -> None:
+        if not self._network_command_id:
+            return
+        operation = snapshot.operation(self._network_command_id)
+        if operation is None:
+            return
+        states = tuple(operation.statuses)
+        applied = sum(status.state.value == "applied" for status in states)
+        pending = {"pending", "sent", "received", "queued"}
+        failures = [
+            status for status in states
+            if status.state.value not in pending | {"applied"}
+        ]
+        # 下发成功不等于防火墙生效；直接展示学生回执，不能让失败藏在计数里。
+        text = f"禁止外网：{applied}/{len(states)} 台策略已应用"
+        if failures:
+            status = failures[0]
+            device = snapshot.device(status.device_id)
+            hostname = device.hostname if device else status.device_id
+            text += f" · {len(failures)} 台失败 · {hostname}：{status.detail or status.state.value}"
+        elif applied < len(states):
+            text += " · 等待确认"
+        self.operation_status.setText(text)
+        self.operation_status.setToolTip(text)
+        if all(status.state.value not in pending for status in states):
+            self._network_command_id = None
 
     def _set_usb_storage_blocked(self, enabled: bool) -> None:
         self._submit(
@@ -587,6 +748,7 @@ class TeacherMainWindow(QMainWindow):
             self.operation_drawer.set_operations(snapshot.operations)
             self._refresh_audit(snapshot.operations)
             self._consume_process_result(snapshot)
+            self._consume_network_result(snapshot)
         if self._snapshot:
             for device in self._snapshot.devices:
                 frame = self.runtime.inspection_media.take(device.device_id)
@@ -606,10 +768,12 @@ class TeacherMainWindow(QMainWindow):
         devices = [
             item for item in self._snapshot.devices
             if not search or search in item.hostname.casefold()
+            or search in item.note.casefold()
             or search in str(item.metadata.get("ip", "")).casefold()
         ]
         signature = tuple(
-            (item.device_id, item.hostname, item.online, item.group, str(item.metadata.get("ip", "")))
+            (item.device_id, item.hostname, item.note, item.online, item.group,
+             str(item.metadata.get("ip", "")))
             for item in devices
         )
         if signature != self._device_signature:
@@ -638,6 +802,34 @@ class TeacherMainWindow(QMainWindow):
         self.config.set("ui.seat_positions", positions)
         self.config.save()
 
+    def _copy_device_name(self, device_id: str) -> None:
+        device = self._snapshot.device(device_id) if self._snapshot else None
+        if device is None:
+            return
+        # 只有用户点击设备名才写剪贴板，刷新和自动巡视不能打扰用户剪贴板。
+        QApplication.clipboard().setText(device.hostname)
+        self.operation_status.setText(f"已复制设备名：{device.hostname}")
+
+    def _edit_device_note(self, device_id: str) -> None:
+        device = self._snapshot.device(device_id) if self._snapshot else None
+        if device is None:
+            return
+        note, accepted = QInputDialog.getText(
+            self, "设备备注", f"{device.hostname}\n备注（留空清除）：", text=device.note,
+        )
+        if not accepted:
+            return
+        try:
+            changed = self.runtime.set_device_note(device_id, note)
+            self.operation_status.setText(
+                ("设备备注已保存" if note.strip() else "设备备注已清除")
+                if changed else "设备备注未更改"
+            )
+            self._poll_runtime()
+        except Exception as exc:
+            logger.warning(f"Cannot save device note for {device_id}: {exc}")
+            QMessageBox.warning(self, "备注保存失败", str(exc))
+
     def _set_selected_group(self) -> None:
         if not self._selected_ids:
             QMessageBox.warning(self, "无法分组", "请先选择学生设备")
@@ -664,6 +856,8 @@ class TeacherMainWindow(QMainWindow):
         for index, device in enumerate(self._snapshot.devices):
             card = PatrolCard(device)
             card.opened.connect(self._open_viewer)
+            card.copy_requested.connect(self._copy_device_name)
+            card.note_requested.connect(self._edit_device_note)
             self._patrol_cards[device.device_id] = card
             self.patrol_grid.addWidget(card, index // 4, index % 4)
         self.patrol_grid.setRowStretch((len(self._snapshot.devices) + 3) // 4, 1)
@@ -730,28 +924,44 @@ class TeacherMainWindow(QMainWindow):
 
     def _add_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "添加文件")
-        for path in paths:
-            self._queue_path(path)
+        self._queue_paths(paths)
 
     def _add_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "添加文件夹")
         if path:
             self._queue_path(path)
 
+    def _queue_paths(self, paths: List[str]) -> None:
+        for path in paths:
+            self._queue_path(path)
+
     def _queue_path(self, path: str) -> None:
-        if any(item["path"] == path for item in self.file_queue):
+        if not path:
             return
-        is_dir = os.path.isdir(path)
-        size = 0
-        if is_dir:
-            for root, _dirs, files in os.walk(path):
-                for name in files:
-                    try:
-                        size += os.path.getsize(os.path.join(root, name))
-                    except OSError:
-                        pass
-        else:
-            size = os.path.getsize(path)
+        try:
+            path = os.path.abspath(os.path.normpath(path))
+            # 选择框与拖放共用同一队列，避免大小写、相对路径造成重复发送。
+            if any(os.path.normcase(item["path"]) == os.path.normcase(path)
+                   for item in self.file_queue):
+                return
+            is_dir = os.path.isdir(path)
+            if not is_dir and not os.path.isfile(path):
+                raise OSError("文件或文件夹不存在")
+            size = 0
+            if is_dir:
+                for root, _dirs, files in os.walk(path):
+                    for name in files:
+                        try:
+                            size += os.path.getsize(os.path.join(root, name))
+                        except OSError:
+                            pass
+            else:
+                size = os.path.getsize(path)
+        except (OSError, ValueError) as exc:
+            # 拖入后文件仍可能被移走；只报告这一项，不弹窗或中断后续文件入队。
+            logger.warning(f"Cannot queue file {path!r}: {exc}")
+            self.operation_status.setText(f"未添加：{os.path.basename(path)}（{exc}）")
+            return
         self.file_queue.append({"path": path, "size": size, "type": "文件夹" if is_dir else "文件", "status": "等待"})
         row = self.file_table.rowCount()
         self.file_table.insertRow(row)
@@ -822,7 +1032,10 @@ class TeacherMainWindow(QMainWindow):
     def _process_device_changed(self, *_args) -> None:
         # 进程身份只属于查询时的设备，切换或离线后不能继续操作旧列表。
         self._process_command_id = None
+        self._processes = []
         self.process_table.setRowCount(0)
+        self.process_count.setText("选择设备后点击“刷新进程”")
+        self._process_selection_changed()
 
     def _consume_process_result(self, snapshot) -> None:
         if not self._process_command_id:
@@ -832,25 +1045,45 @@ class TeacherMainWindow(QMainWindow):
             return
         status = operation.statuses[0]
         if status.state.value == "applied":
-            processes = status.payload.get("processes", [])
-            self.process_table.setRowCount(0)
-            for process in processes:
-                row = self.process_table.rowCount()
-                self.process_table.insertRow(row)
-                values = (
-                    process.get("pid", ""), process.get("name", ""),
-                    process.get("path", ""), process.get("username", ""),
-                    process.get("protection_reason", "") if process.get("protected") else "",
-                )
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(str(value or ""))
-                    item.setData(Qt.UserRole, process)
-                    self.process_table.setItem(row, column, item)
+            self._processes = list(status.payload.get("processes", []))
+            self._render_processes()
             self._process_command_id = None
-            self.operation_status.setText(f"已读取 {len(processes)} 个进程")
+            self.operation_status.setText(f"已读取 {len(self._processes)} 个进程")
         elif status.state.value in {"failed", "timed_out"}:
             self._process_command_id = None
             self.operation_status.setText(f"进程读取失败：{status.detail}")
+
+    def _render_processes(self, *_args) -> None:
+        search = self.process_search.text().strip().casefold()
+        show_protected = self.show_system_processes.isChecked()
+        self.process_table.setRowCount(0)
+        for process in self._processes:
+            if process.get("protected") and not show_protected:
+                continue
+            values = (
+                process.get("name", ""), process.get("pid", ""),
+                process.get("path", ""), process.get("username", ""),
+                "受保护" if process.get("protected") else "可管理",
+            )
+            if search and not any(search in str(value).casefold() for value in values[:3]):
+                continue
+            row = self.process_table.rowCount()
+            self.process_table.insertRow(row)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                item.setData(Qt.UserRole, process)
+                item.setToolTip(str(process.get("protection_reason", "")) if column == 4 else str(value or ""))
+                self.process_table.setItem(row, column, item)
+        self.process_count.setText(f"显示 {self.process_table.rowCount()} / {len(self._processes)} 项")
+        self._process_selection_changed()
+
+    def _process_selection_changed(self) -> None:
+        row = self.process_table.currentRow()
+        item = self.process_table.item(row, 0) if row >= 0 else None
+        process = item.data(Qt.UserRole) if item else None
+        editable = bool(process and not process.get("protected"))
+        self.process_block_button.setEnabled(editable)
+        self.process_terminate_button.setEnabled(editable)
 
     def _selected_process(self):
         row = self.process_table.currentRow()
@@ -876,26 +1109,99 @@ class TeacherMainWindow(QMainWindow):
     def _blacklist_selected_process(self) -> None:
         try:
             process = self._selected_process()
-            device_id = str(self.process_device.currentData())
-            if QMessageBox.question(self, "永久应用策略", f"永久禁止运行 {process.get('name')}？\n只有教师端可以解除。") != QMessageBox.Yes:
-                return
-            self.runtime.set_blacklist(
-                DeviceIds([device_id]), str(process.get("name") or ""),
-                str(process.get("path") or ""), True,
-            )
+            if process.get("protected"):
+                raise ValueError("该进程受保护，不能添加禁用规则")
+            # 跨机器安装路径不同；从进程列表带入程序名，避免只禁中一台机器。
+            self.application_program.setText(str(process.get("name") or ""))
+            self.application_scope.setCurrentIndex(0)
+            self.policy_tabs.setCurrentIndex(0)
+            self.application_feedback.setText("已填入程序名，点击“全班禁用”后生效。")
         except Exception as exc:
             QMessageBox.warning(self, "无法添加策略", str(exc))
 
-    def _remove_blacklist(self) -> None:
-        row = self.blacklist_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "无法解除", "请先选择一条黑名单策略")
+    def _application_scope_changed(self, *_args) -> None:
+        global_rule = self.application_scope.currentData() == "global"
+        enabled = self._snapshot.application_control_enabled if self._snapshot else True
+        self.application_block_button.setText(
+            ("全班禁用" if global_rule else "禁用当前范围") if enabled else "保存规则"
+        )
+        if not enabled:
+            self.application_feedback.setText("软件禁用已暂停，规则仍可编辑；开启总开关后统一生效。")
             return
-        value = self.blacklist_table.item(row, 0).data(Qt.UserRole)
+        self.application_feedback.setText(
+            "全班规则持续生效，离线设备上线后补发，新加入的设备自动继承。"
+            if global_rule else "仅应用到顶栏当前选定的范围，新加入的设备不自动继承。"
+        )
+
+    def _apply_application_rule(self) -> None:
         try:
-            self.runtime.set_blacklist(
-                DeviceIds([value["device_id"]]), value["program"], value["path"], False
+            program = normalize_program_name(self.application_program.text())
+            if self.application_scope.currentData() == "global":
+                receipt = self.runtime.set_global_blacklist(program, True)
+                message = f"{program} 全班禁用规则已保存，已向 {len(receipt.target_ids)} 台设备下发。"
+            else:
+                scope = self._current_scope()
+                if not self._resolve_scope_ids(scope):
+                    raise ValueError("当前作用域没有设备，请先选择设备或使用全班规则")
+                receipt = self.runtime.set_blacklist(scope, program, "", True)
+                message = f"{program} 禁用指令已向 {len(receipt.target_ids)} 台设备下发。"
+            if not self.runtime.snapshot().application_control_enabled:
+                message = f"{program} 规则已保存，软件禁用已暂停，开启总开关后生效。"
+            self.application_program.setText(program)
+            self.application_feedback.setText(message + "执行结果见下方；离线设备上线后补发。")
+            self.operation_status.setText(message)
+            self._poll_runtime()
+        except Exception as exc:
+            logger.warning(f"Cannot apply application rule: {exc}")
+            self.application_feedback.setText(str(exc))
+
+    def _sync_application_control_switch(self) -> None:
+        enabled = self._snapshot.application_control_enabled if self._snapshot else True
+        self.application_control_switch.blockSignals(True)
+        self.application_control_switch.setChecked(enabled)
+        self.application_control_switch.blockSignals(False)
+        self.application_control_status.setText("已开启" if enabled else "已暂停")
+        global_rule = self.application_scope.currentData() == "global"
+        self.application_block_button.setText(
+            ("全班禁用" if global_rule else "禁用当前范围") if enabled else "保存规则"
+        )
+
+    def _toggle_application_control(self, enabled: bool) -> None:
+        try:
+            self.runtime.set_application_control_enabled(enabled)
+            self._poll_runtime()
+            message = (
+                "软件禁用已开启，正在恢复已保存的禁用规则。"
+                if enabled else "软件禁用已暂停，正在通知学生恢复运行；禁用规则已保留。"
             )
+            self.application_feedback.setText(message + "离线设备上线后同步。")
+            self.operation_status.setText(message)
+        except Exception as exc:
+            logger.warning(f"Cannot toggle application control: {exc}")
+            self._snapshot = self.runtime.snapshot()
+            self._sync_application_control_switch()
+            self.application_feedback.setText(f"切换失败：{exc}")
+
+    def _remove_blacklist(self, value=None) -> None:
+        if not isinstance(value, dict):
+            row = self.blacklist_table.currentRow()
+            if row < 0:
+                return
+            value = self.blacklist_table.item(row, 0).data(Qt.UserRole)
+        program = value["program"]
+        if QMessageBox.question(
+            self, "解除禁用", f"确定解除 {program} 的禁用规则？\n离线设备将在下次上线时恢复。",
+        ) != QMessageBox.Yes:
+            return
+        try:
+            if value["global"]:
+                self.runtime.set_global_blacklist(program, False)
+            else:
+                self.runtime.set_blacklist(
+                    DeviceIds(value["device_ids"]), program, value["path"], False,
+                )
+            self.application_feedback.setText(f"{program} 解除指令已下发，离线设备上线后恢复。")
+            self._poll_runtime()
         except Exception as exc:
             QMessageBox.warning(self, "无法解除", str(exc))
 
@@ -963,7 +1269,6 @@ class TeacherMainWindow(QMainWindow):
         if self.process_device.currentData() != current:
             self._process_device_changed()
         self.maintenance_table.setRowCount(0)
-        self.blacklist_table.setRowCount(0)
         for device in devices:
             row = self.maintenance_table.rowCount()
             self.maintenance_table.insertRow(row)
@@ -976,23 +1281,122 @@ class TeacherMainWindow(QMainWindow):
             )
             for column, value in enumerate(values):
                 self.maintenance_table.setItem(row, column, QTableWidgetItem(str(value)))
-            for state in device.expected:
-                if not state.domain.startswith("blacklist:") or not state.value:
+            self.maintenance_table.item(row, 0).setData(Qt.UserRole, device.device_id)
+            name = DeviceNameWidget(device)
+            # 单元格控件要遮住下方原始文本，避免主机名与备注叠字。
+            name.setBackgroundRole(QPalette.Base)
+            name.setAutoFillBackground(True)
+            name.copy_requested.connect(self._copy_device_name)
+            name.note_requested.connect(self._edit_device_note)
+            self.maintenance_table.setCellWidget(row, 0, name)
+            self.maintenance_table.setRowHeight(row, max(36, name.sizeHint().height() + 6))
+        self._refresh_application_rules()
+
+    def _refresh_application_rules(self, *_args) -> None:
+        snapshot = self._snapshot
+        self.blacklist_table.setRowCount(0)
+        if snapshot is None:
+            return
+        self._sync_application_control_switch()
+        enabled = snapshot.application_control_enabled
+        operations = {operation.revision: operation for operation in snapshot.operations}
+        globals_active = set(snapshot.global_blacklist)
+        rules = {
+            (program, enabled): {"global": True, "configured": True, "devices": list(snapshot.devices)}
+            for program in globals_active
+        }
+        for identity, device_ids in snapshot.local_blacklist_rules.items():
+            if identity in globals_active:
+                continue
+            rules[(identity, enabled)] = {
+                "global": False, "configured": True,
+                "devices": [device for device in snapshot.devices if device.device_id in device_ids],
+            }
+        for device in snapshot.devices:
+            for expected in device.expected:
+                if not expected.domain.startswith("blacklist:"):
                     continue
-                identity = state.domain.split(":", 1)[1]
-                policy_row = self.blacklist_table.rowCount()
-                self.blacklist_table.insertRow(policy_row)
-                is_path = "\\" in identity or "/" in identity
-                data = {
-                    "device_id": device.device_id,
-                    "program": ntpath.basename(identity) if is_path else identity,
-                    "path": identity if is_path else "",
-                }
-                first = QTableWidgetItem(device.hostname)
-                first.setData(Qt.UserRole, data)
-                self.blacklist_table.setItem(policy_row, 0, first)
-                self.blacklist_table.setItem(policy_row, 1, QTableWidgetItem(identity))
-                self.blacklist_table.setItem(policy_row, 2, QTableWidgetItem("永久生效"))
+                identity = expected.domain.split(":", 1)[1]
+                source = rules.get((identity, enabled))
+                if source and any(item.device_id == device.device_id for item in source["devices"]):
+                    continue
+                actual = device.actual_for(expected.domain)
+                if (not expected.value and actual is not None and not actual.value
+                        and actual.command_revision == expected.command_revision):
+                    continue
+                rule = rules.setdefault(
+                    (identity, bool(expected.value)), {"global": False, "configured": False, "devices": []},
+                )
+                rule["devices"].append(device)
+        search = self.application_rule_search.text().strip().casefold()
+        for (identity, blocked), rule in sorted(rules.items()):
+            if search and search not in identity.casefold():
+                continue
+            devices = rule["devices"]
+            applied = offline = failed = pending = 0
+            details = []
+            for device in devices:
+                expected = device.expected_for("blacklist:" + identity)
+                actual = device.actual_for("blacklist:" + identity)
+                operation = operations.get(expected.command_revision) if expected else None
+                status = operation.status_for(device.device_id) if operation else None
+                if (expected and actual and actual.command_revision == expected.command_revision
+                        and bool(actual.value) == blocked):
+                    applied += 1
+                    result = "已禁用" if blocked else "已恢复"
+                elif status and status.state.value in {"failed", "timed_out"}:
+                    failed += 1
+                    result = f"失败：{status.detail or status.state.value}"
+                elif not device.online:
+                    offline += 1
+                    result = "离线，等待上线"
+                else:
+                    pending += 1
+                    result = "等待学生确认"
+                details.append(f"{device.hostname}：{result}")
+            if devices:
+                result_text = f"{'已禁用' if blocked else '已恢复'} {applied}/{len(devices)}"
+            else:
+                result_text = "等待设备加入"
+            paused = rule["configured"] and not enabled
+            if paused:
+                result_text = "已暂停 · " + result_text
+            elif not blocked:
+                result_text = "解除中 · " + result_text
+            for count, label in ((failed, "失败"), (offline, "离线待下发"), (pending, "待确认")):
+                if count:
+                    result_text += f" · {count} 台{label}"
+            is_path = "\\" in identity or "/" in identity
+            data = {
+                "global": rule["global"], "program": ntpath.basename(identity) if is_path else identity,
+                "path": identity if is_path else "", "device_ids": [device.device_id for device in devices],
+            }
+            scope = "全班 · 含新设备" if rule["global"] else (
+                devices[0].hostname if len(devices) == 1 else f"{len(devices)} 台设备"
+            )
+            row = self.blacklist_table.rowCount()
+            self.blacklist_table.insertRow(row)
+            for column, text in enumerate((identity, scope, result_text)):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, data)
+                item.setToolTip("\n".join(details) if column == 2 else text)
+                self.blacklist_table.setItem(row, column, item)
+            actions = QWidget()
+            action_layout = QHBoxLayout(actions)
+            action_layout.setContentsMargins(4, 2, 4, 2)
+            button = QPushButton("解除" if blocked or paused else "重试解除")
+            button.setProperty("compact", True)
+            button.clicked.connect(lambda _checked, value=data: self._remove_blacklist(value))
+            action_layout.addWidget(button)
+            self.blacklist_table.setCellWidget(row, 3, actions)
+            self.blacklist_table.setRowHeight(row, 40)
+        count = self.blacklist_table.rowCount()
+        self.application_rule_count.setText(f"禁用规则 · {len(rules)} 项")
+        self.application_empty.setText(
+            "没有匹配的规则，请调整搜索内容。" if rules else
+            "尚未添加禁用规则。在上方输入程序名，或从“进程管理”选择软件。"
+        )
+        self.application_rules_stack.setCurrentIndex(0 if count else 1)
 
     def _refresh_audit(self, operations) -> None:
         self.audit_table.setRowCount(0)

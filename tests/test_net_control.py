@@ -123,6 +123,42 @@ def test_repeated_block_and_changed_teacher_whitelist(firewall):
         assert list(policy.Rules) != previous
 
 
+def test_repeated_block_repairs_rules_removed_outside_the_client(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert controller.block_internet(["192.168.1.2"])
+        policy.Rules.values.clear()
+        assert controller.block_internet(["192.168.1.2"])
+    assert list(policy.Rules)
+
+
+def test_repeated_block_rechecks_disabled_firewall(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert controller.block_internet(["192.168.1.2"])
+        policy._oleobj_.Invoke.return_value = False
+        assert not controller.block_internet(["192.168.1.2"])
+    assert "防火墙" in controller.last_error
+
+
+@pytest.mark.parametrize("network", ["0.0.0.0/0", "::/0"])
+def test_block_rejects_exemption_that_allows_the_entire_internet(firewall, network):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert not controller.block_internet(["192.168.1.2", network])
+    assert "白名单" in controller.last_error
+    assert not list(policy.Rules)
+    assert not controller.is_blocked()
+
+
+def test_block_rejects_url_instead_of_silently_ignoring_invalid_exemption(firewall):
+    controller, policy = firewall
+    with patch("sys.platform", "win32"):
+        assert not controller.block_internet(["https://www.baidu.com"])
+    assert "IP 或 CIDR" in controller.last_error
+    assert not list(policy.Rules)
+
+
 def test_linux_unblock_success_when_commands_accept():
     controller = NetController()
     controller._blocked = True

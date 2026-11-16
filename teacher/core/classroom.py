@@ -9,6 +9,7 @@ injected at internal seams so the same behaviour is deterministic in tests.
 from __future__ import annotations
 
 import heapq
+import ntpath
 import threading
 import time
 import uuid
@@ -17,6 +18,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from common.v2.control import AckStage as AckPhase
 from common.v2.control import ControlEnvelope
+from common.device_identity import normalize_mac
+from common.application_policy import normalize_program_name
 from common.v2.model import (
     All,
     ClassroomAction,
@@ -284,6 +287,13 @@ class Classroom:
         self._actual: Dict[str, Dict[str, Dict[str, Any]]] = dict(
             persisted.get("actual", {})
         )
+        self._global_blacklist: Dict[str, bool] = dict(persisted.get("global_blacklist", {}))
+        self._application_control_enabled = bool(persisted.get("application_control_enabled", True))
+        self._local_blacklist_rules: Dict[str, List[str]] = {
+            identity: list(device_ids)
+            for identity, device_ids in persisted.get("local_blacklist_rules", {}).items()
+        }
+        self._remember_local_blacklist_rules()
         self._current: Dict[Tuple[str, str], Tuple[str, int]] = {}
         self._envelopes: Dict[str, Any] = {}
 
@@ -301,6 +311,7 @@ class Classroom:
             self._merge_device(device, notify=False)
             if device.online:
                 self._sync_permanent(device.device_id)
+                self._sync_global_blacklist(device.device_id)
         self._persist()
 
     def submit(self, action: ClassroomAction, scope: TargetScope) -> OperationReceipt:
@@ -340,7 +351,10 @@ class Classroom:
             self._ensure_open()
             if self._snapshot_revision <= after_revision:
                 return None
-            devices = tuple(self._device_snapshot(device_id) for device_id in sorted(self._devices))
+            devices = tuple(
+                self._device_snapshot(device_id) for device_id in sorted(self._devices)
+                if not self._devices[device_id].get("metadata", {}).get("identity_alias_of")
+            )
             operations = tuple(
                 self._receipt(command_id)
                 for command_id, _ in sorted(
@@ -352,6 +366,9 @@ class Classroom:
                 devices=devices,
                 operations=operations,
                 observed_at=self._clock.now(),
+                global_blacklist=tuple(sorted(self._global_blacklist)),
+                application_control_enabled=self._application_control_enabled,
+                local_blacklist_rules=self._local_blacklist_rules,
             )
 
     def open_inspection(
@@ -395,15 +412,128 @@ class Classroom:
         if self._closed:
             raise RuntimeError("Classroom is closed")
 
+    def set_global_blacklist(self, program: str, enabled: bool = True) -> OperationReceipt:
+        program = normalize_program_name(program)
+        with self._lock:
+            self._ensure_open()
+            previous = dict(self._global_blacklist)
+            previous_local = dict(self._local_blacklist_rules)
+            if enabled:
+                self._global_blacklist[program] = True
+            else:
+                self._global_blacklist.pop(program, None)
+            self._local_blacklist_rules.pop(program, None)
+            try:
+                # 持续规则与本次全班下发一起持久化，教师重启后仍为新设备补发。
+                return self.submit(ClassroomAction(
+                    CommandKind.BLACKLIST_SET
+                    if enabled and self._application_control_enabled else CommandKind.BLACKLIST_CLEAR,
+                    {"program": program, "path": ""},
+                ), All())
+            except Exception:
+                self._global_blacklist = previous
+                self._local_blacklist_rules = previous_local
+                raise
+
+    def set_blacklist(
+        self, scope: TargetScope, program: str, path: str = "", enabled: bool = True,
+    ) -> OperationReceipt:
+        with self._lock:
+            self._ensure_open()
+            targets = self._resolve(scope)
+            identity = str(path or program).lower()
+            saved_targets = set(self._local_blacklist_rules.get(identity, ()))
+            if enabled and identity not in self._global_blacklist:
+                saved_targets.update(targets)
+            else:
+                saved_targets.difference_update(targets)
+            if saved_targets:
+                self._local_blacklist_rules[identity] = sorted(saved_targets)
+            else:
+                self._local_blacklist_rules.pop(identity, None)
+            return self.submit(ClassroomAction(
+                CommandKind.BLACKLIST_SET
+                if enabled and self._application_control_enabled else CommandKind.BLACKLIST_CLEAR,
+                {"program": program, "path": path},
+            ), DeviceIds(targets))
+
+    def _remember_local_blacklist_rules(self) -> None:
+        # 从旧版本已下发策略补建教师配置；暂停时不能仅依赖将被改成解除的执行状态。
+        for device_id, domains in self._desired.items():
+            for domain, state in domains.items():
+                if not domain.startswith("blacklist:") or not state.get("value"):
+                    continue
+                identity = domain.split(":", 1)[1]
+                if identity in self._global_blacklist:
+                    continue
+                targets = self._local_blacklist_rules.setdefault(identity, [])
+                if device_id not in targets:
+                    targets.append(device_id)
+
+    def set_application_control_enabled(self, enabled: bool) -> Tuple[OperationReceipt, ...]:
+        with self._lock:
+            self._ensure_open()
+            enabled = bool(enabled)
+            if self._application_control_enabled == enabled:
+                return ()
+            self._remember_local_blacklist_rules()
+            self._application_control_enabled = enabled
+            kind = CommandKind.BLACKLIST_SET if enabled else CommandKind.BLACKLIST_CLEAR
+            receipts = []
+            for program in tuple(self._global_blacklist):
+                receipts.append(self.submit(
+                    ClassroomAction(kind, {"program": program, "path": ""}), All(),
+                ))
+            for identity, device_ids in self._local_blacklist_rules.items():
+                is_path = "\\" in identity or "/" in identity
+                receipts.append(self.submit(ClassroomAction(kind, {
+                    "program": ntpath.basename(identity) if is_path else identity,
+                    "path": identity if is_path else "",
+                }), DeviceIds(device_ids)))
+            # 即使还没有规则也保存开关，教师重启后不能意外恢复限制。
+            self._bump_and_persist()
+            return tuple(receipts)
+
+    def set_device_note(self, device_id: str, note: str) -> bool:
+        with self._lock:
+            self._ensure_open()
+            canonical_id = self.resolve_device_alias(device_id)
+            device = self._devices.get(canonical_id)
+            if device is None:
+                raise KeyError("设备记录不存在")
+            note = note.strip()
+            if device.get("note", "") == note:
+                return False
+            # 备注归教师所有，只修改本地持久记录，不向学生发送改名指令。
+            device["note"] = note
+            self._bump_and_persist()
+            return True
+
+    def resolve_device_alias(self, device_id: str) -> str:
+        with self._lock:
+            current = str(device_id)
+            visited = set()
+            while current not in visited:
+                visited.add(current)
+                alias = self._devices.get(current, {}).get("metadata", {}).get("identity_alias_of")
+                if not alias or alias not in self._devices:
+                    return current
+                current = str(alias)
+            raise RuntimeError("设备身份别名存在循环")
+
     def _resolve(self, scope: TargetScope) -> Tuple[str, ...]:
         if isinstance(scope, All):
-            return tuple(sorted(self._devices))
+            return tuple(sorted(
+                device_id for device_id, device in self._devices.items()
+                if not device.get("metadata", {}).get("identity_alias_of")
+            ))
         if isinstance(scope, Group):
             return tuple(
                 sorted(
                     device_id
                     for device_id, device in self._devices.items()
                     if device.get("group", "default") == scope.name
+                    and not device.get("metadata", {}).get("identity_alias_of")
                 )
             )
         if isinstance(scope, DeviceIds):
@@ -418,7 +548,10 @@ class Classroom:
                         "metadata": {},
                     },
                 )
-            return scope.device_ids
+            return tuple(dict.fromkeys(
+                self.resolve_device_alias(device_id)
+                for device_id in scope.device_ids
+            ))
         raise TypeError("unknown target scope")
 
     def _prepare_target(
@@ -640,6 +773,7 @@ class Classroom:
             self._merge_device(device, notify=False)
             if device.online and not was_online:
                 self._sync_permanent(device.device_id)
+                self._sync_global_blacklist(device.device_id)
             elif was_online and not device.online:
                 self._expire_disconnected_temporary_controls(device.device_id)
             self._bump_and_persist()
@@ -670,15 +804,78 @@ class Classroom:
             self._actual.get(device_id, {}).pop(domain, None)
 
     def _merge_device(self, device: TransportDevice, notify: bool = True) -> None:
+        previous = self._devices.get(device.device_id, {})
+        alias = previous.get("metadata", {}).get("identity_alias_of")
+        if alias:
+            # 旧连接迟到的离线事件不能重新创建已归档的重复座位。
+            return
+        metadata = dict(device.metadata or {})
+        if not metadata.get("machine_id") and previous.get("metadata", {}).get("machine_id"):
+            metadata["machine_id"] = previous["metadata"]["machine_id"]
         self._devices[device.device_id] = {
             "hostname": device.hostname,
+            "note": str(previous.get("note", "")),
             "group": device.group,
             "online": bool(device.online),
             "last_seen": float(device.last_seen or self._clock.now()),
-            "metadata": dict(device.metadata or {}),
+            "metadata": metadata,
         }
         if notify:
             self._bump_and_persist()
+
+    def consolidate_duplicate_devices(self, canonical_id: str) -> Tuple[str, ...]:
+        with self._lock:
+            self._ensure_open()
+            canonical = self._devices.get(canonical_id)
+            if canonical is None:
+                return ()
+            metadata = canonical.get("metadata", {})
+            mac = normalize_mac(metadata.get("mac"))
+            if not mac or metadata.get("identity_alias_of"):
+                return ()
+            consolidated = []
+            for device_id, device in self._devices.items():
+                other = device.get("metadata", {})
+                if device_id == canonical_id or device.get("online") or other.get("identity_alias_of"):
+                    continue
+                if normalize_mac(other.get("mac")) != mac or device.get("hostname") != canonical.get("hostname"):
+                    continue
+                if metadata.get("machine_id") and other.get("machine_id"):
+                    if metadata["machine_id"] != other["machine_id"]:
+                        continue
+                if device.get("group", "default") not in {"default", canonical.get("group", "default")}:
+                    continue
+                if any(state.get("permanent") for state in self._desired.get(device_id, {}).values()):
+                    continue
+                previous_note = str(device.get("note", ""))
+                canonical_note = str(canonical.get("note", ""))
+                if previous_note and canonical_note and previous_note != canonical_note:
+                    # 不同备注可能对应教师刻意区分的设备，不能自动归并并隐藏其中一条。
+                    continue
+                if previous_note and not canonical_note:
+                    canonical["note"] = previous_note
+                self._expire_disconnected_temporary_controls(device_id)
+                # 只归档证据一致且无策略冲突的离线副本；不删历史操作或迁移永久限制。
+                device.setdefault("metadata", {})["identity_alias_of"] = canonical_id
+                consolidated.append(device_id)
+            if consolidated:
+                self._bump_and_persist()
+            return tuple(consolidated)
+
+    def _sync_global_blacklist(self, device_id: str) -> None:
+        device = self._devices.get(device_id, {})
+        if device.get("metadata", {}).get("identity_alias_of"):
+            return
+        for program in tuple(self._global_blacklist):
+            desired = self._desired.get(device_id, {}).get("blacklist:" + program)
+            if desired and bool(desired.get("value")) == self._application_control_enabled:
+                continue
+            # 注册事件可能重复到达；已存在的永久规则沿用原命令，避免重复审计和下发。
+            self.submit(ClassroomAction(
+                CommandKind.BLACKLIST_SET
+                if self._application_control_enabled else CommandKind.BLACKLIST_CLEAR,
+                {"program": program, "path": ""},
+            ), DeviceIds([device_id]))
 
     def _sync_permanent(self, device_id: str) -> None:
         for domain, desired in self._desired.get(device_id, {}).items():
@@ -759,6 +956,7 @@ class Classroom:
         return DeviceSnapshot(
             device_id=device_id,
             hostname=str(device.get("hostname", device_id)),
+            note=str(device.get("note", "")),
             group=str(device.get("group", "default")),
             online=bool(device.get("online", False)),
             last_seen=float(device.get("last_seen", 0.0)),
@@ -890,6 +1088,9 @@ class Classroom:
                 "operations": self._operations,
                 "desired": self._desired,
                 "actual": self._actual,
+                "global_blacklist": self._global_blacklist,
+                "application_control_enabled": self._application_control_enabled,
+                "local_blacklist_rules": self._local_blacklist_rules,
             }
         )
 

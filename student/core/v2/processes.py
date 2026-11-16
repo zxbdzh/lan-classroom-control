@@ -7,30 +7,10 @@ from enum import Enum
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
 from common.logger import get_logger
+from common.application_policy import PROTECTED_PROCESS_NAMES as DEFAULT_PROTECTED_PROCESS_NAMES
 from .storage import normalize_executable_name, normalize_windows_path
 
 logger = get_logger("student_v2_processes")
-
-
-DEFAULT_PROTECTED_PROCESS_NAMES = frozenset({
-    "system",
-    "system idle process",
-    "registry",
-    "smss.exe",
-    "csrss.exe",
-    "wininit.exe",
-    "services.exe",
-    "lsass.exe",
-    "winlogon.exe",
-    "svchost.exe",
-    "fontdrvhost.exe",
-    "dwm.exe",
-    "explorer.exe",
-    "lanclassroom-student.exe",
-    "lanclassroom-student-service.exe",
-    "lanclassroom-student-agent.exe",
-    "winvnc.exe",
-})
 
 
 class ProcessTerminationStatus(str, Enum):

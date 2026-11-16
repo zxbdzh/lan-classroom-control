@@ -43,6 +43,9 @@ def _empty_state() -> Dict[str, Any]:
         "operations": {},
         "desired": {},
         "actual": {},
+        "global_blacklist": {},
+        "application_control_enabled": True,
+        "local_blacklist_rules": {},
     }
 
 
@@ -206,6 +209,17 @@ class SQLiteStateStore:
             ).fetchone()
             if row is not None:
                 state["command_revision"] = int(row[0])
+            row = self._connection.execute(
+                "SELECT value FROM classroom_meta WHERE key='global_blacklist'"
+            ).fetchone()
+            if row is not None:
+                state["global_blacklist"] = json.loads(row[0])
+            for key in ("application_control_enabled", "local_blacklist_rules"):
+                row = self._connection.execute(
+                    "SELECT value FROM classroom_meta WHERE key=?", (key,),
+                ).fetchone()
+                if row is not None:
+                    state[key] = json.loads(row[0])
 
             for row in self._connection.execute("SELECT * FROM devices"):
                 metadata = json.loads(row["metadata_json"])
@@ -275,6 +289,19 @@ class SQLiteStateStore:
                 "INSERT OR REPLACE INTO classroom_meta(key, value) VALUES (?, ?)",
                 (key, str(value)),
             )
+        rules = dict(current.get("global_blacklist", {}))
+        if rules != previous.get("global_blacklist", {}) or self._cached_state is None:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO classroom_meta(key, value) VALUES (?, ?)",
+                ("global_blacklist", _json_dumps(rules)),
+            )
+        for key, default in (("application_control_enabled", True), ("local_blacklist_rules", {})):
+            value = current.get(key, default)
+            if value != previous.get(key, default) or self._cached_state is None:
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO classroom_meta(key, value) VALUES (?, ?)",
+                    (key, _json_dumps(value)),
+                )
 
     def _save_devices(self, current: Mapping[str, Any], previous: Mapping[str, Any]) -> None:
         current_devices = dict(current.get("devices", {}))

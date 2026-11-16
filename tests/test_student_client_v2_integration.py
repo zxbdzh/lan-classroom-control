@@ -326,3 +326,19 @@ def test_service_replays_active_desktop_controls_to_restarted_agent():
     client._restore_temporary_controls()
     assert client._session_replay == {}
     client.stop()
+
+
+def test_registration_includes_machine_hint_without_replacing_persisted_device_id():
+    with patch("student.core.student_client.machine_fingerprint", return_value="hardware-01"):
+        client = client_with_memory_state(service_mode=True)
+    try:
+        original_id = client.student_id
+        client.tcp_client.send_message = MagicMock(return_value=True)
+        client.heartbeat_sender.start = MagicMock()
+        client._on_connected()
+        registration = client.tcp_client.send_message.call_args.args[0]["params"]
+        assert registration["student_id"] == original_id
+        assert registration["machine_id"] == "hardware-01"
+        assert client.state_store.get_or_create_device_id() == original_id
+    finally:
+        client.stop()

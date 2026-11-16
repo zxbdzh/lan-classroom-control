@@ -53,6 +53,15 @@ def stylesheet(theme: str = "light") -> str:
     QPushButton[primary="true"] { background: %(primary)s; border-color: %(primary)s; color: white; }
     QPushButton[primary="true"]:hover { background: %(primary_hover)s; }
     QPushButton[danger="true"] { color: %(danger)s; border-color: %(danger)s; }
+    QPushButton[compact="true"] { min-height: 26px; padding: 0 8px; }
+    QLabel#SectionTitle { font-size: 15px; font-weight: 600; }
+    QFrame#ApplicationComposer { background: %(panel_alt)s; border: 1px solid %(line)s; border-radius: 5px; }
+    QTabWidget#ApplicationTabs::pane { border: 1px solid %(line)s; background: %(panel)s; }
+    QTabWidget#ApplicationTabs QTabBar::tab { background: %(panel_alt)s; color: %(muted)s;
+        border: 1px solid %(line)s; padding: 9px 20px; margin-right: 4px; }
+    QTabWidget#ApplicationTabs QTabBar::tab:selected { background: %(panel)s; color: %(primary)s;
+        border-bottom: 2px solid %(primary)s; font-weight: 600; }
+    QCheckBox { color: %(ink)s; spacing: 6px; background: transparent; }
     QPushButton#NavButton { border: 0; border-radius: 4px; text-align: left;
         padding-left: 14px; min-height: 42px; color: %(muted)s; background: transparent; }
     QPushButton#NavButton:hover { color: %(ink)s; background: %(panel_alt)s; }

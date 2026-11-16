@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Dict, Iterable, Mapping, Optional, Set
+from typing import Dict, Iterable, Mapping, Optional, Set, Tuple
 
 from common.config import get_config
+from common.device_identity import normalize_mac
 from common.v2.control import ControlEnvelope
 from common.v2.model import (
     All,
@@ -345,31 +346,60 @@ class TeacherRuntime:
             return tuple(item.device_id for item in current.devices)
         raise TypeError("unsupported target scope")
 
+    def set_global_blacklist(self, program: str, enabled: bool = True) -> OperationReceipt:
+        return self.classroom.set_global_blacklist(program, enabled)
+
+    def set_application_control_enabled(self, enabled: bool) -> Tuple[OperationReceipt, ...]:
+        return self.classroom.set_application_control_enabled(enabled)
+
     def set_blacklist(
         self, scope: TargetScope, program: str, path: str = "", enabled: bool = True
-    ):
-        kind = CommandKind.BLACKLIST_SET if enabled else CommandKind.BLACKLIST_CLEAR
-        return self.submit(
-            ClassroomAction(kind, {"program": program, "path": path}), scope
-        )
+    ) -> OperationReceipt:
+        return self.classroom.set_blacklist(scope, program, path, enabled)
+
+    def set_device_note(self, device_id: str, note: str) -> bool:
+        return self.classroom.set_device_note(device_id, note)
 
     def set_group(self, device_ids: Iterable[str], group: str) -> int:
         if not hasattr(self.server, "set_student_group"):
             raise RuntimeError("transport does not support device groups")
         return self.server.set_student_group(tuple(device_ids), group)
 
-    def _resolve_registered_identity(self, device_id: str, mac: str):
+    def _resolve_registered_identity(
+        self, device_id: str, mac: str, machine_id: str = ""
+    ):
         snapshot = self.classroom.snapshot()
-        normalized_mac = str(mac or "").strip().casefold()
+        normalized_mac = normalize_mac(mac)
+        machine_id = str(machine_id or "").strip()
+        direct = snapshot.device(self.classroom.resolve_device_alias(str(device_id)))
+        if direct is not None and machine_id:
+            if direct.metadata.get("machine_id") == machine_id:
+                self.classroom.consolidate_duplicate_devices(direct.device_id)
+                return direct.device_id, direct.group
+        if direct is not None and normalized_mac:
+            previous_machine = str(direct.metadata.get("machine_id") or "")
+            incompatible = machine_id and previous_machine and machine_id != previous_machine
+            if not incompatible and normalize_mac(direct.metadata.get("mac")) == normalized_mac:
+                self.classroom.consolidate_duplicate_devices(direct.device_id)
+                return direct.device_id, direct.group
         if normalized_mac:
             for device in snapshot.devices:
-                if str(device.metadata.get("mac") or "").strip().casefold() == normalized_mac:
+                previous_machine = str(device.metadata.get("machine_id") or "")
+                if machine_id and previous_machine and machine_id != previous_machine:
+                    continue
+                if normalize_mac(device.metadata.get("mac")) == normalized_mac:
+                    self.classroom.consolidate_duplicate_devices(device.device_id)
                     return device.device_id, device.group
-        direct = snapshot.device(str(device_id))
         if direct is not None:
-            previous_mac = str(direct.metadata.get("mac") or "").strip().casefold()
-            if previous_mac and normalized_mac and previous_mac != normalized_mac:
-                # 克隆镜像可能复制设备 ID；不同物理网卡不能互相挤掉在线连接。
+            previous_machine = str(direct.metadata.get("machine_id") or "")
+            if machine_id and previous_machine and machine_id != previous_machine:
+                # 不同硬件即使复制同一学生数据库、且原机离线，也不能吞并座位。
+                return str(uuid.uuid5(
+                    uuid.NAMESPACE_OID, f"lan-classroom:{device_id}:machine:{machine_id}"
+                )), "default"
+            previous_mac = normalize_mac(direct.metadata.get("mac"))
+            if direct.online and previous_mac and normalized_mac and previous_mac != normalized_mac:
+                # 旧客户端缺少硬件提示时，仅在在线冲突时按不同网卡区分克隆机。
                 return str(uuid.uuid5(
                     uuid.NAMESPACE_OID, f"lan-classroom:{device_id}:{normalized_mac}"
                 )), "default"

@@ -152,6 +152,84 @@ def test_cloned_device_id_with_different_mac_keeps_both_devices():
         runtime.close()
 
 
+def test_restarted_device_keeps_identity_after_network_adapter_changes():
+    transport = InMemoryTransport()
+    transport.connect("stable-id", "PC-01", "第一组", metadata={"mac": "00:11:22:33:44:01"})
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    try:
+        transport.disconnect("stable-id")
+        assert runtime._resolve_registered_identity(
+            "stable-id", "00:11:22:33:44:02"
+        ) == ("stable-id", "第一组")
+    finally:
+        runtime.close()
+
+
+def test_matching_hardware_and_persisted_id_reconnect_before_old_socket_times_out():
+    transport = InMemoryTransport()
+    transport.connect("stable-id", "PC-01", "第一组", metadata={
+        "mac": "02:10:20:30:40:01", "machine_id": "hardware-01",
+    })
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    try:
+        assert runtime._resolve_registered_identity(
+            "stable-id", "02:10:20:30:40:02", "hardware-01"
+        ) == ("stable-id", "第一组")
+    finally:
+        runtime.close()
+
+
+def test_offline_cloned_device_with_different_hardware_keeps_its_own_identity():
+    transport = InMemoryTransport()
+    transport.connect("cloned", "PC-01", metadata={
+        "mac": "02:10:20:30:40:01", "machine_id": "hardware-01",
+    })
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    try:
+        transport.disconnect("cloned")
+        clone_id, _group = runtime._resolve_registered_identity(
+            "cloned", "02:10:20:30:40:02", "hardware-02"
+        )
+        assert clone_id != "cloned"
+        transport.connect(clone_id, "PC-01", metadata={
+            "mac": "02:10:20:30:40:02", "machine_id": "hardware-02",
+        })
+        assert runtime._resolve_registered_identity(
+            "cloned", "02:10:20:30:40:02", "hardware-02"
+        )[0] == clone_id
+        assert len(runtime.snapshot().devices) == 2
+    finally:
+        runtime.close()
+
+
+def test_shared_firmware_uuid_alone_does_not_merge_distinct_installations():
+    transport = InMemoryTransport()
+    transport.connect("first-id", "PC-01", metadata={
+        "mac": "02:10:20:30:40:01", "machine_id": "generic-firmware",
+    })
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    try:
+        assert runtime._resolve_registered_identity(
+            "second-id", "02:10:20:30:40:02", "generic-firmware"
+        ) == ("second-id", "default")
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("mac", ["00-11-22-33-44-AB", "0011223344ab", "0011.2233.44ab"])
+def test_restarted_device_matches_equivalent_mac_without_creating_a_new_identity(mac):
+    transport = InMemoryTransport()
+    transport.connect("stable-id", "PC-01", "第一组", metadata={"mac": "00:11:22:33:44:ab"})
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    try:
+        transport.disconnect("stable-id")
+        assert runtime._resolve_registered_identity("regenerated-id", mac) == (
+            "stable-id", "第一组"
+        )
+    finally:
+        runtime.close()
+
+
 def test_server_service_readiness_is_rfb_banner_not_only_process_start(tmp_path, monkeypatch):
     import configparser
     import win32service
@@ -183,6 +261,7 @@ def test_server_service_readiness_is_rfb_banner_not_only_process_start(tmp_path,
     config.read(str(tmp_path / "UltraVNC" / "LanClassroomVNC.ini"))
     assert config.getint("admin", "PortNumber") == 15900
     assert config.getint("admin", "HTTPConnect") == 0
+    assert config.getint("admin", "RemoveWallpaper") == 0
 
 
 @pytest.mark.parametrize("pending", [False, True])

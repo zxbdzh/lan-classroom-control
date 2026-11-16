@@ -3,6 +3,7 @@ import threading
 from typing import Dict, List, Optional, Callable
 from common.logger import get_logger
 from common.tcp_conn import TCPConnection
+from common.device_identity import normalize_mac
 
 logger = get_logger("student_manager")
 
@@ -175,10 +176,12 @@ class StudentManager:
         return None
 
     def find_by_mac(self, mac: str) -> Optional[StudentInfo]:
+        normalized = normalize_mac(mac)
+        if not normalized:
+            return None
         with self._lock:
-            mac_lower = mac.lower()
             for student in self._students.values():
-                if student.mac.lower() == mac_lower:
+                if normalize_mac(student.mac) == normalized:
                     return student
         return None
 

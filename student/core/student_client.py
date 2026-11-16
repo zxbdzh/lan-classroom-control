@@ -14,6 +14,7 @@ from common.discover import StudentDiscoverListener
 from common.heartbeat import StudentHeartbeatSender
 from common.logger import get_logger
 from common.config import get_config
+from common.device_identity import machine_fingerprint
 from common.version import get_version
 from student.core.update_client import UpdateClient
 from student.core import autostart
@@ -79,6 +80,7 @@ class StudentClient:
         self.hostname = socket.gethostname()
         self.local_ip = self._get_local_ip()
         self.mac_address = self._get_mac()
+        self.machine_id = machine_fingerprint()
 
         self.tcp_client = TCPClient()
         self.discover_listener = StudentDiscoverListener(
@@ -381,6 +383,7 @@ class StudentClient:
             "hostname": self.hostname,
             "ip": self.local_ip,
             "mac": self.mac_address,
+            "machine_id": self.machine_id,
             "version": get_version(),
             "protocol_version": 2,
             "capabilities": list(V2_CAPABILITIES),

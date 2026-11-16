@@ -1,21 +1,156 @@
 import os
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, Qt
+from PyQt5.QtCore import QCoreApplication, QEvent, QMimeData, QPoint, QPointF, Qt, QUrl
 from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton, QTableWidgetItem
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QPixmap
 
-from teacher.core.classroom import AckPhase, InMemoryTransport, TransportDevice
+from teacher.core.classroom import AckPhase, InMemoryTransport, TransportAck, TransportDevice
 from teacher.core.runtime import TeacherRuntime
 from common.v2.model import CommandKind, DeviceIds, InspectionMode
 from teacher.ui.main_window import TeacherMainWindow
-from teacher.ui.widgets import EmptySeat, FullScreenViewer, SeatTile
+from teacher.ui.widgets import DeviceNameWidget, EmptySeat, FullScreenViewer, SeatTile
 from student.ui.overlay import OverlayWindow
+
+
+@pytest.fixture
+def file_drop_window(qtbot):
+    transport = InMemoryTransport()
+    transport.scan_devices = MagicMock()
+    transport.file_distributor = MagicMock()
+    transport.send_file = MagicMock(return_value="transfer-1")
+    transport.connect("pc-01", "PC-01")
+    transport.connect("pc-02", "PC-02")
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window.poll_timer.stop()
+    window.show()
+    window._show_page("files")
+    window._poll_runtime()
+    QApplication.processEvents()
+    yield window
+    window.close()
+
+
+def _drop_on_file_table(window, mime, point, actions=Qt.CopyAction | Qt.MoveAction):
+    events = (
+        QDragEnterEvent(point, actions, mime, Qt.LeftButton, Qt.NoModifier),
+        QDragMoveEvent(point, actions, mime, Qt.LeftButton, Qt.NoModifier),
+        QDropEvent(QPointF(point), actions, mime, Qt.LeftButton, Qt.NoModifier),
+    )
+    for event in events:
+        if actions & Qt.MoveAction:
+            event.setDropAction(Qt.MoveAction)
+        QApplication.sendEvent(window.file_table.viewport(), event)
+    return events
+
+
+@pytest.mark.parametrize("over_existing_row", [False, True])
+def test_file_drop_queues_local_paths_then_uses_explicit_send(
+    file_drop_window, tmp_path, qtbot, over_existing_row,
+):
+    window = file_drop_window
+    lesson = tmp_path / "中文 课件 #1.txt"
+    lesson.write_bytes(b"lesson")
+    worksheet = tmp_path / "练习.pdf"
+    worksheet.write_bytes(b"worksheet")
+    folder = tmp_path / "作业文件夹"
+    folder.mkdir()
+    (folder / "答案.txt").write_bytes(b"answers")
+    paths = [str(lesson), str(worksheet), str(folder)]
+    if over_existing_row:
+        window._queue_path(paths[0])
+        point = window.file_table.visualItemRect(window.file_table.item(0, 0)).center()
+    else:
+        point = QPoint(20, 20)
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(path) for path in paths] + [
+        QUrl("https://example.invalid/lesson.txt"),
+        QUrl.fromLocalFile(str(tmp_path / "missing.txt")),
+    ])
+
+    with qtbot.captureExceptions() as exceptions:
+        events = _drop_on_file_table(window, mime, point)
+
+    assert not exceptions
+    assert all(event.isAccepted() and event.dropAction() == Qt.CopyAction for event in events)
+    assert [item["path"] for item in window.file_queue] == paths
+    assert [item["size"] for item in window.file_queue] == [6, 9, 7]
+    assert [item["type"] for item in window.file_queue] == ["文件", "文件", "文件夹"]
+    assert window.file_table.rowCount() == 3
+    assert window.file_table.item(0, 0).text() == lesson.name
+    assert all(item["status"] == "等待" for item in window.file_queue)
+    window.runtime.server.send_file.assert_not_called()
+
+    _drop_on_file_table(window, mime, point)
+    assert window.file_table.rowCount() == 3
+    assert len(window.file_queue) == 3
+    window._selected_ids = {"pc-01"}
+    window.scope_buttons["selected"].setChecked(True)
+    window.runtime.server.send_file.side_effect = ["transfer-1", "transfer-2", "transfer-3"]
+    send_button = next(button for button in window.findChildren(QPushButton)
+                       if button.text() == "开始分发")
+    qtbot.mouseClick(send_button, Qt.LeftButton)
+    assert window.runtime.server.send_file.call_args_list == [
+        call(path, ["pc-01"]) for path in paths
+    ]
+    assert all(item["status"] == "发送中" for item in window.file_queue)
+
+
+@pytest.mark.parametrize("payload", ["web", "text", "internal", "missing", "empty", "move-only"])
+def test_file_drop_rejects_non_files_without_changing_queue(file_drop_window, tmp_path, payload):
+    window = file_drop_window
+    mime = QMimeData()
+    actions = Qt.CopyAction | Qt.MoveAction
+    if payload == "web":
+        mime.setUrls([QUrl("https://example.invalid/lesson.txt")])
+    elif payload == "text":
+        mime.setText(str(tmp_path))
+    elif payload == "internal":
+        mime.setData("application/x-qabstractitemmodeldatalist", b"table rows")
+    elif payload == "missing":
+        mime.setUrls([QUrl.fromLocalFile(str(tmp_path / "missing.txt"))])
+    elif payload == "move-only":
+        mime.setUrls([QUrl.fromLocalFile(str(tmp_path))])
+        actions = Qt.MoveAction
+
+    events = _drop_on_file_table(window, mime, QPoint(20, 20), actions)
+
+    assert not any(event.isAccepted() for event in events)
+    assert not window.file_queue
+    assert window.file_table.rowCount() == 0
+    window.runtime.server.send_file.assert_not_called()
+
+
+def test_file_queue_normalizes_paths_and_ignores_disappearing_files(
+    file_drop_window, tmp_path, monkeypatch,
+):
+    window = file_drop_window
+    lesson = tmp_path / "Lesson.txt"
+    lesson.write_bytes(b"lesson")
+    window._queue_path(str(lesson))
+    window._queue_path(str(tmp_path / "." / lesson.name))
+    window._queue_path(str(tmp_path / ".." / tmp_path.name / lesson.name))
+    monkeypatch.chdir(tmp_path)
+    window._queue_path(lesson.name)
+    window._queue_path("")
+    window._queue_path(str(tmp_path / "missing.txt"))
+    if os.name == "nt":
+        window._queue_path(str(lesson).upper())
+    unreadable = tmp_path / "unreadable.txt"
+    unreadable.write_bytes(b"unreadable")
+    with patch("teacher.ui.main_window.os.path.getsize", side_effect=OSError("unavailable")):
+        window._queue_path(str(unreadable))
+
+    assert len(window.file_queue) == 1
+    assert window.file_table.rowCount() == 1
+    assert window.file_queue[0]["path"] == str(lesson)
 
 
 def test_teacher_console_has_seven_pages_and_stable_1366_layout(qtbot):
@@ -276,3 +411,289 @@ def test_process_device_change_clears_old_rows_and_pending_query(qtbot, device_d
     window._consume_process_result(late_snapshot)
     late_snapshot.operation.assert_not_called()
     window.close()
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_network_button_reports_applied_or_failure_instead_of_only_submission(qtbot, success):
+    transport = InMemoryTransport()
+    transport.scan_devices = MagicMock()
+    transport.file_distributor = MagicMock()
+    transport.connect("pc-01", "PC-01")
+    runtime = TeacherRuntime(server=transport, database_path=":memory:")
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window._poll_runtime()
+    window.scope_buttons["all"].setChecked(True)
+    window._block_network()
+    operation = runtime.snapshot().operations[-1]
+    detail = "请先启用 Windows 防火墙的全部网络配置" if not success else ""
+    transport.ack(operation.command_id, "pc-01", AckPhase.APPLIED,
+                  operation.revision, success=success, detail=detail)
+
+    window._poll_runtime()
+
+    if success:
+        assert "策略已应用" in window.operation_status.text()
+    else:
+        assert "失败" in window.operation_status.text()
+        assert detail in window.operation_status.text()
+        assert detail in window.operation_drawer.list.item(0).toolTip()
+    window.close()
+
+
+@pytest.mark.parametrize("surface", ["classroom", "inspection", "maintenance"])
+def test_device_name_copy_and_note_controls_are_per_device_and_update_views(
+    file_drop_window, qtbot, surface,
+):
+    window = file_drop_window
+    window.runtime.server.connect("pc-02", "PC-01")
+    window._poll_runtime()
+    window._show_page(surface)
+
+    def device_name_widget():
+        if surface == "classroom":
+            return next(tile for tile in window.seat_map.findChildren(SeatTile)
+                        if tile.device.device_id == "pc-01").findChild(DeviceNameWidget)
+        if surface == "inspection":
+            return window._patrol_cards["pc-01"].findChild(DeviceNameWidget)
+        for row in range(window.maintenance_table.rowCount()):
+            if window.maintenance_table.item(row, 0).data(Qt.UserRole) == "pc-01":
+                return window.maintenance_table.cellWidget(row, 0)
+        raise AssertionError("设备行不存在")
+
+    widget = device_name_widget()
+    clipboard = MagicMock()
+    with patch("teacher.ui.main_window.QApplication.clipboard", return_value=clipboard):
+        qtbot.mouseClick(widget.copy_button, Qt.LeftButton)
+    clipboard.setText.assert_called_once_with("PC-01")
+    assert "复制" in window.operation_status.text()
+
+    with patch("teacher.ui.main_window.QInputDialog.getText", return_value=("第一排 / 李同学", True)):
+        qtbot.mouseClick(widget.note_button, Qt.LeftButton)
+    window._poll_runtime()
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert window.runtime.snapshot().device("pc-01").note == "第一排 / 李同学"
+    assert window.runtime.snapshot().device("pc-02").note == ""
+    for container in (window.seat_map, window._patrol_cards["pc-01"], window.maintenance_table):
+        matching = [name for name in container.findChildren(DeviceNameWidget)
+                    if name.device_id == "pc-01"]
+        assert len(matching) == 1
+        assert matching[0].note_label.text() == "第一排 / 李同学"
+    with patch("teacher.ui.main_window.QInputDialog.getText", return_value=("不保存", False)) as dialog:
+        qtbot.mouseClick(device_name_widget().note_button, Qt.LeftButton)
+    assert dialog.call_args.kwargs["text"] == "第一排 / 李同学"
+    assert window.runtime.snapshot().device("pc-01").note == "第一排 / 李同学"
+    window.classroom_search.setText("李同学")
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert [tile.device.device_id for tile in window.seat_map.findChildren(SeatTile)
+            if not sip.isdeleted(tile)] == ["pc-01"]
+    window.classroom_search.clear()
+    window._show_page(surface)
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    with patch("teacher.ui.main_window.QInputDialog.getText", return_value=("", True)):
+        qtbot.mouseClick(device_name_widget().note_button, Qt.LeftButton)
+    window._poll_runtime()
+    assert window.runtime.snapshot().device("pc-01").note == ""
+    assert not window.runtime.server.sent
+
+
+def test_device_names_only_copy_on_explicit_click_and_show_full_name_in_tooltip(
+    file_drop_window, qtbot,
+):
+    window = file_drop_window
+    hostname = "PC-20230202LWWA-VERY-LONG-DEVICE-NAME"
+    clipboard = MagicMock()
+    with patch("teacher.ui.main_window.QApplication.clipboard", return_value=clipboard):
+        window.runtime.server.connect("pc-01", hostname)
+        window._poll_runtime()
+        window._show_page("inspection")
+        window.resize(1093, 614)
+        QApplication.processEvents()
+        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        clipboard.setText.assert_not_called()
+        name = window._patrol_cards["pc-01"].findChild(DeviceNameWidget)
+        assert hostname in name.copy_button.toolTip()
+        assert name.copy_button.fontMetrics().horizontalAdvance(name.copy_button.text()) <= name.copy_button.width()
+        assert name.note_button.isVisible()
+        qtbot.mouseClick(name.copy_button, Qt.LeftButton)
+        clipboard.setText.assert_called_once_with(hostname)
+
+
+def test_device_note_save_failure_is_reported_without_renaming_device(file_drop_window):
+    window = file_drop_window
+    with patch("teacher.ui.main_window.QInputDialog.getText", return_value=("备注", True)), \
+            patch.object(window.runtime, "set_device_note", side_effect=OSError("磁盘写入失败")), \
+            patch("teacher.ui.main_window.QMessageBox.warning") as warning:
+        window._edit_device_note("pc-01")
+    warning.assert_called_once_with(window, "备注保存失败", "磁盘写入失败")
+    assert window.runtime.snapshot().device("pc-01").hostname == "PC-01"
+    assert window.runtime.snapshot().device("pc-01").note == ""
+
+
+def test_global_application_form_ignores_topbar_scope_and_can_clear_all(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    window._selected_ids = {"pc-01"}
+    window.scope_buttons["selected"].setChecked(True)
+    window.runtime.server.disconnect("pc-02")
+    window._poll_runtime()
+    window.application_program.setText("Chrome.EXE")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    snapshot = window.runtime.snapshot()
+    operation = snapshot.operations[-1]
+    assert operation.target_ids == ("pc-01", "pc-02")
+    assert snapshot.global_blacklist == ("chrome.exe",)
+    assert window.blacklist_table.rowCount() == 1
+    assert "全班" in window.blacklist_table.item(0, 1).text()
+    assert "离线" in window.blacklist_table.item(0, 2).text()
+    assert "永久生效" not in window.blacklist_table.item(0, 2).text()
+    window.runtime.server.ack(
+        operation.command_id, "pc-01", AckPhase.APPLIED, operation.revision,
+        success=False, detail="学生端拒绝执行",
+    )
+    window._poll_runtime()
+    assert "失败" in window.blacklist_table.item(0, 2).text()
+    assert "学生端拒绝执行" in window.blacklist_table.item(0, 2).toolTip()
+    clear = window.blacklist_table.cellWidget(0, 3).findChild(QPushButton)
+    with patch("teacher.ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes):
+        qtbot.mouseClick(clear, Qt.LeftButton)
+    assert window.runtime.snapshot().global_blacklist == ()
+    assert window.runtime.snapshot().operations[-1].action.kind is CommandKind.BLACKLIST_CLEAR
+
+
+def test_process_browser_filters_system_processes_and_uses_name_for_global_rule(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    window.policy_tabs.setCurrentIndex(1)
+    window._query_processes()
+    operation = window.runtime.snapshot().operations[-1]
+    processes = [
+        {"pid": 10, "name": "chrome.exe", "path": r"C:\Program Files\Chrome\chrome.exe",
+         "creation_time": 10.0, "username": "学生", "protected": False},
+        {"pid": 11, "name": "svchost.exe", "path": r"C:\Windows\svchost.exe",
+         "creation_time": 11.0, "protected": True, "protection_reason": "system"},
+    ]
+    window.runtime.classroom._on_ack(TransportAck(
+        operation.command_id, "pc-01", AckPhase.APPLIED, operation.revision,
+        payload={"processes": processes},
+    ))
+    window._poll_runtime()
+    assert window.process_table.rowCount() == 1
+    window.process_search.setText("找不到")
+    assert window.process_table.rowCount() == 0
+    window.process_search.clear()
+    window.show_system_processes.setChecked(True)
+    assert window.process_table.rowCount() == 2
+    window.show_system_processes.setChecked(False)
+    window.process_table.selectRow(0)
+    qtbot.mouseClick(window.process_block_button, Qt.LeftButton)
+    assert window.policy_tabs.currentIndex() == 0
+    assert window.application_program.text() == "chrome.exe"
+    assert not window.runtime.snapshot().global_blacklist
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    assert window.runtime.snapshot().global_blacklist == ("chrome.exe",)
+    assert window.runtime.snapshot().operations[-1].action.payload["path"] == ""
+
+
+@pytest.mark.parametrize("width,height", [(1366, 768), (1093, 614)])
+def test_application_page_actions_fit_without_horizontal_scrolling(file_drop_window, width, height):
+    window = file_drop_window
+    window.resize(width, height)
+    window._show_page("policies")
+    QApplication.processEvents()
+    for index, buttons in (
+        (0, [window.application_block_button]),
+        (1, [window.process_block_button, window.process_terminate_button]),
+    ):
+        window.policy_tabs.setCurrentIndex(index)
+        QApplication.processEvents()
+        for button in buttons:
+            assert button.isVisible()
+            assert button.mapTo(window.pages, button.rect().topRight()).x() <= window.pages.width()
+
+
+def test_application_rule_reports_only_confirmed_results_and_retains_restore_progress(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    window.application_program.setText("notepad.exe")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    operation = window.runtime.snapshot().operations[-1]
+    assert "已禁用 0/2" in window.blacklist_table.item(0, 2).text()
+    window.runtime.server.ack(operation.command_id, "pc-01", AckPhase.RECEIVED, operation.revision)
+    window._poll_runtime()
+    assert "已禁用 0/2" in window.blacklist_table.item(0, 2).text()
+    for device_id in ("pc-01", "pc-02"):
+        window.runtime.server.ack(operation.command_id, device_id, AckPhase.APPLIED, operation.revision)
+    window._poll_runtime()
+    assert window.blacklist_table.item(0, 2).text() == "已禁用 2/2"
+    value = window.blacklist_table.item(0, 0).data(Qt.UserRole)
+    with patch("teacher.ui.main_window.QMessageBox.question", return_value=QMessageBox.No):
+        window._remove_blacklist(value)
+    assert window.runtime.snapshot().global_blacklist == ("notepad.exe",)
+    with patch("teacher.ui.main_window.QMessageBox.question", return_value=QMessageBox.Yes):
+        window._remove_blacklist(value)
+    restored = window.runtime.snapshot().operations[-1]
+    assert "解除中" in window.blacklist_table.item(0, 2).text()
+    for device_id in ("pc-01", "pc-02"):
+        window.runtime.server.ack(restored.command_id, device_id, AckPhase.APPLIED, restored.revision)
+    window._poll_runtime()
+    assert window.blacklist_table.rowCount() == 0
+    assert window.application_empty.isVisible()
+
+
+def test_application_rule_current_scope_is_distinct_from_persistent_global_rule(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    window.scope_buttons["selected"].setChecked(True)
+    window._selected_ids = {"pc-01"}
+    window.application_scope.setCurrentIndex(1)
+    window.application_program.setText("game.exe")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    operation = window.runtime.snapshot().operations[-1]
+    assert operation.target_ids == ("pc-01",)
+    assert window.runtime.snapshot().global_blacklist == ()
+    window.runtime.server.connect("pc-03", "新设备")
+    assert not window.runtime.server.sent_to("pc-03")
+    window.application_program.setText("explorer.exe")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    assert "受保护" in window.application_feedback.text()
+    assert len(window.runtime.snapshot().operations) == 1
+
+
+def test_application_control_switch_preserves_visible_rules_and_resumes_them(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    window.application_program.setText("game.exe")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    assert window.application_control_switch.isChecked()
+    qtbot.mouseClick(window.application_control_switch, Qt.LeftButton)
+    assert window.runtime.snapshot().application_control_enabled is False
+    assert not window.application_control_switch.isChecked()
+    assert window.blacklist_table.rowCount() == 1
+    assert window.blacklist_table.item(0, 0).text() == "game.exe"
+    assert "暂停" in window.blacklist_table.item(0, 2).text()
+    assert window.application_block_button.text() == "保存规则"
+    assert window.runtime.snapshot().operations[-1].action.kind is CommandKind.BLACKLIST_CLEAR
+    window.application_program.setText("editor.exe")
+    qtbot.mouseClick(window.application_block_button, Qt.LeftButton)
+    assert window.blacklist_table.rowCount() == 2
+    assert window.runtime.snapshot().operations[-1].action.kind is CommandKind.BLACKLIST_CLEAR
+    count = len(window.runtime.snapshot().operations)
+    window._poll_runtime()
+    assert len(window.runtime.snapshot().operations) == count
+    qtbot.mouseClick(window.application_control_switch, Qt.LeftButton)
+    assert window.runtime.snapshot().application_control_enabled is True
+    assert window.runtime.snapshot().global_blacklist == ("editor.exe", "game.exe")
+    assert window.blacklist_table.rowCount() == 2
+    assert window.application_block_button.text() == "全班禁用"
+    assert window.runtime.snapshot().operations[-1].action.kind is CommandKind.BLACKLIST_SET
+
+
+def test_application_control_switch_failure_reverts_visual_state(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("policies")
+    with patch.object(window.runtime, "set_application_control_enabled", side_effect=OSError("保存失败")):
+        qtbot.mouseClick(window.application_control_switch, Qt.LeftButton)
+    assert window.application_control_switch.isChecked()
+    assert window.runtime.snapshot().application_control_enabled is True
+    assert "保存失败" in window.application_feedback.text()

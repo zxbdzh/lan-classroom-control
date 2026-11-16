@@ -47,11 +47,12 @@ class TeacherServer:
         self.on_student_screen_frame: Optional[Callable] = None
         self._v2_ack_handler: Optional[Callable[[TransportAck], None]] = None
         self._v2_device_handler: Optional[Callable[[TransportDevice], None]] = None
-        self._v2_identity_resolver: Optional[Callable[[str, str], tuple]] = None
+        self._v2_identity_resolver: Optional[Callable[[str, str, str], tuple]] = None
         self._teacher_heartbeat_stop = threading.Event()
         self._teacher_heartbeat_thread = None
         self._heartbeat_pending = set()
         self._heartbeat_pending_lock = threading.Lock()
+        self._registration_lock = threading.RLock()
 
         self._setup_callbacks()
 
@@ -159,6 +160,10 @@ class TeacherServer:
             logger.error(f"Handle message error from {conn.addr}: {e}")
 
     def _on_disconnect(self, conn: TCPConnection):
+        with self._registration_lock:
+            self._disconnect_student(conn)
+
+    def _disconnect_student(self, conn: TCPConnection):
         if conn.student_id:
             current = self.student_manager.get_student(conn.student_id)
             if current is not None and current.conn is not conn:
@@ -176,27 +181,35 @@ class TeacherServer:
             conn.stop()
 
     def _handle_student_register(self, conn: TCPConnection, params: dict):
+        # 身份解析与连接替换必须串行，否则同时重连会各自创建一个座位。
+        with self._registration_lock:
+            self._register_student(conn, params)
+
+    def _register_student(self, conn: TCPConnection, params: dict):
         student_id = params.get("student_id", "")
         hostname = params.get("hostname", "unknown")
         ip = conn.addr[0] if conn.addr and conn.addr[0] else params.get("ip", "")
         mac = params.get("mac", "")
+        machine_id = str(params.get("machine_id") or "").strip()
         version = params.get("version", "")
         protocol_version = int(params.get("protocol_version", 1) or 1)
 
         existing_by_mac = self.student_manager.find_by_mac(mac) if mac else None
         replaced_connection = None
         resolved_group = "default"
-        if existing_by_mac and existing_by_mac.student_id != student_id:
-            student_id = existing_by_mac.student_id
-            resolved_group = existing_by_mac.group
-        elif self._v2_identity_resolver is not None:
-            resolved = self._v2_identity_resolver(str(student_id), str(mac))
+        if self._v2_identity_resolver is not None:
+            resolved = self._v2_identity_resolver(str(student_id), str(mac), machine_id)
             if resolved:
                 student_id, resolved_group = str(resolved[0]), str(resolved[1])
+        elif existing_by_mac and existing_by_mac.student_id != student_id:
+            student_id = existing_by_mac.student_id
+            resolved_group = existing_by_mac.group
 
         existing = self.student_manager.get_student(student_id)
         if existing is not None and existing.conn is not conn:
             replaced_connection = existing.conn
+        if existing is not None and not machine_id:
+            machine_id = str(existing.status.get("machine_id") or "")
 
         conn.student_id = student_id
         student = StudentInfo(
@@ -208,9 +221,10 @@ class TeacherServer:
             conn=conn
         )
         student.group = resolved_group
-        self.student_manager.add_student(student)
         student.status["protocol_version"] = protocol_version
         student.status["capabilities"] = list(params.get("capabilities", []))
+        student.status["machine_id"] = machine_id
+        self.student_manager.add_student(student)
         self.heartbeat_manager.register_student(student_id)
         logger.info(f"Student registered: {hostname} ({ip}) [{mac}]")
         self._emit_v2_device(student_id, online=True)
@@ -226,7 +240,11 @@ class TeacherServer:
                 logger.warning(f"Auto notify update to {hostname} failed: {e}")
 
     def _handle_heartbeat(self, conn: TCPConnection, params: dict):
-        if conn.student_id:
+        with self._registration_lock:
+            current = self.student_manager.get_student(conn.student_id) if conn.student_id else None
+            if current is None or current.conn is not conn:
+                return
+            # 被替换连接的迟到心跳不能把已离线的新会话重新标记为在线。
             self.heartbeat_manager.record_heartbeat(conn.student_id)
             self.student_manager.update_heartbeat(conn.student_id)
 
@@ -286,7 +304,7 @@ class TeacherServer:
     def set_device_handler(self, handler: Callable[[TransportDevice], None]):
         self._v2_device_handler = handler
 
-    def set_identity_resolver(self, resolver: Callable[[str, str], tuple]):
+    def set_identity_resolver(self, resolver: Callable[[str, str, str], tuple]):
         self._v2_identity_resolver = resolver
 
     def set_student_group(self, student_ids, group: str) -> int:
@@ -332,6 +350,7 @@ class TeacherServer:
             metadata={
                 "ip": student.ip,
                 "mac": student.mac,
+                "machine_id": student.status.get("machine_id", ""),
                 "version": student.version,
                 "display_name": student.display_name,
                 "protocol_version": int(student.status.get("protocol_version", 1)),

@@ -169,7 +169,8 @@ class UltraVNCServer:
             "InputsEnabled": "1", "LocalInputsDisabled": "0",
             "FileTransferEnabled": "0", "QuerySetting": "2",
             "QueryAccept": "2", "QueryIfNoLogon": "0",
-            "LockSetting": "0", "RemoveWallpaper": "1",
+            # 远控不修改学生壁纸，也避免快速退出服务时来不及恢复背景。
+            "LockSetting": "0", "RemoveWallpaper": "0",
             "AllowProperties": "0", "AllowEditClients": "0", "AllowShutdown": "0",
             "DisableTrayIcon": "1", "BlankMonitorEnabled": "0",
         }

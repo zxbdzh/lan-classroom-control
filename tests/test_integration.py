@@ -78,7 +78,7 @@ class TestTeacherStudentIntegration:
     def test_registration_restores_persistent_identity_and_group(self):
         server = TeacherServer(tcp_port=0, broadcast_port=0)
         server.set_identity_resolver(
-            lambda device_id, mac: ("stable-id", "第一组")
+            lambda device_id, mac, machine_id: ("stable-id", "第一组")
         )
         connection = MagicMock()
         connection.addr = ("192.168.10.21", 50000)
@@ -179,6 +179,140 @@ class TestTeacherStudentIntegration:
         })
 
         assert frames == [("stable-id", b"jpeg", (320, 180))]
+
+    def test_reconnect_reuses_same_mac_despite_separator_and_case_changes(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        original = MagicMock()
+        original.addr = ("192.168.10.21", 50000)
+        server._handle_student_register(original, {
+            "student_id": "stable-id", "hostname": "PC-21",
+            "mac": "00:11:22:33:44:ab",
+        })
+        server.set_student_group(["stable-id"], "第一组")
+        replacement = MagicMock()
+        replacement.addr = ("192.168.10.22", 50001)
+
+        server._handle_student_register(replacement, {
+            "student_id": "regenerated-id", "hostname": "PC-21",
+            "mac": "00-11-22-33-44-AB",
+        })
+
+        assert server.student_manager.count() == 1
+        assert replacement.student_id == "stable-id"
+        assert server.student_manager.get_student("stable-id").group == "第一组"
+        original.stop.assert_called_once_with()
+        server._on_disconnect(original)
+        assert server.student_manager.get_student("stable-id").online
+
+    def test_reconnect_retains_known_machine_hint_for_legacy_registration(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        original = MagicMock()
+        original.addr = ("192.168.10.21", 50000)
+        server._handle_student_register(original, {
+            "student_id": "stable-id", "hostname": "PC-21",
+            "mac": "02:10:20:30:40:01", "machine_id": "hardware-01",
+        })
+        replacement = MagicMock()
+        replacement.addr = ("192.168.10.21", 50001)
+        server._handle_student_register(replacement, {
+            "student_id": "stable-id", "hostname": "PC-21",
+            "mac": "02:10:20:30:40:01",
+        })
+
+        assert server.devices()[0].metadata["machine_id"] == "hardware-01"
+
+    def test_old_socket_heartbeat_cannot_revive_disconnected_replacement(self):
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        original = MagicMock()
+        original.addr = ("192.168.10.21", 50000)
+        params = {"student_id": "stable-id", "hostname": "PC-21", "mac": "02:10:20:30:40:01"}
+        server._handle_student_register(original, params)
+        replacement = MagicMock()
+        replacement.addr = ("192.168.10.21", 50001)
+        server._handle_student_register(replacement, params)
+        server._on_disconnect(replacement)
+
+        server._handle_heartbeat(original, {})
+
+        assert not server.student_manager.get_student("stable-id").online
+
+    def test_repeated_tcp_reconnect_and_teacher_restart_keep_one_device(self, tmp_path):
+        from teacher.core.runtime import TeacherRuntime
+
+        database = str(tmp_path / "teacher.db")
+        student_database = str(tmp_path / "student.db")
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        server.tcp_server.host = "127.0.0.1"
+        runtime = TeacherRuntime(server=server, database_path=database)
+        server.tcp_server.start()
+        port = server.tcp_server._sock.getsockname()[1]
+        stable_id = None
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                time.sleep(0.01)
+            return False
+
+        try:
+            for iteration in range(4):
+                with StudentStateStore(student_database) as state:
+                    device_id = state.get_or_create_device_id()
+                stable_id = stable_id or device_id
+                assert device_id == stable_id
+                with socket.create_connection(("127.0.0.1", port), timeout=2.0) as connection:
+                    connection.sendall(serialize_message(build_message(
+                        MessageType.STUDENT_REGISTER, {
+                            "student_id": device_id, "hostname": "PC-RECONNECT",
+                            "mac": "02:10:20:30:40:{:02x}".format(iteration + 1),
+                            "machine_id": "hardware-reconnect", "protocol_version": 2,
+                        },
+                    )))
+                    assert wait_until(lambda: (
+                        len(runtime.snapshot().devices) == 1
+                        and runtime.snapshot().device(stable_id).online
+                    ))
+                    if iteration == 0:
+                        server.set_student_group([stable_id], "第一组")
+                    assert runtime.snapshot().device(stable_id).group == "第一组"
+                    assert server.student_manager.count() == 1
+                assert wait_until(lambda: not runtime.snapshot().device(stable_id).online)
+                if iteration == 1:
+                    runtime.close()
+                    runtime = TeacherRuntime(server=server, database_path=database)
+            assert len(runtime.snapshot().devices) == 1
+        finally:
+            server.tcp_server.stop()
+            runtime.close()
+
+    def test_concurrent_reconnections_do_not_create_extra_devices(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from teacher.core.runtime import TeacherRuntime
+
+        server = TeacherServer(tcp_port=0, broadcast_port=0)
+        runtime = TeacherRuntime(server=server, database_path=":memory:")
+        connections = []
+        for iteration in range(6):
+            connection = MagicMock()
+            connection.addr = ("192.168.10.21", 50000 + iteration)
+            connections.append(connection)
+        try:
+            def register(connection):
+                server._handle_student_register(connection, {
+                    "student_id": "stable-id", "hostname": "PC-21",
+                    "mac": "02:10:20:30:40:01", "machine_id": "hardware-01",
+                })
+
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                list(executor.map(register, connections))
+            assert server.student_manager.count() == 1
+            assert len(runtime.snapshot().devices) == 1
+            assert all(connection.student_id == "stable-id" for connection in connections)
+            assert sum(connection.stop.call_count for connection in connections) == 5
+        finally:
+            runtime.close()
 
     def test_student_register(self, teacher_server):
         server, tcp_port = teacher_server
