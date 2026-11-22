@@ -273,6 +273,9 @@ class TeacherMainWindow(QMainWindow):
         action_row.addWidget(search)
         action_row.addWidget(set_group)
         page, layout = self._page_shell("教室", actions)
+        hint = QLabel("点击座位卡片选择；Ctrl+点击可多选，也可使用卡片左侧的“选”框。")
+        hint.setProperty("muted", True)
+        layout.addWidget(hint)
         self.seat_map = SeatMapWidget(
             int(self.config.get("ui.seat_columns", 6)),
             int(self.config.get("ui.seat_rows", 10)),

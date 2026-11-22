@@ -355,6 +355,28 @@ def test_pressing_seat_preserves_drag_source_until_mouse_release(qtbot):
     window.close()
 
 
+def test_seat_selection_checkbox_supports_explicit_single_device_selection(qtbot):
+    runtime = TeacherRuntime(database_path=":memory:")
+    runtime.classroom._on_device(TransportDevice(device_id="pc-01", hostname="PC-01"))
+    window = TeacherMainWindow(runtime=runtime, auto_start=False)
+    qtbot.addWidget(window)
+    window.show()
+    window._poll_runtime()
+    QApplication.processEvents()
+    source = window.seat_map.findChild(SeatTile)
+
+    qtbot.mouseClick(source.selection_box, Qt.LeftButton)
+    assert source.selection_box.isChecked() is True
+    assert source.property("selected") is True
+    assert window._selected_ids == {"pc-01"}
+
+    qtbot.mouseClick(source.selection_box, Qt.LeftButton)
+    assert source.selection_box.isChecked() is False
+    assert source.property("selected") is False
+    assert window._selected_ids == set()
+    window.close()
+
+
 @pytest.mark.parametrize("label, kind", [
     ("关机", CommandKind.POWER_OFF),
     ("重启", CommandKind.REBOOT),

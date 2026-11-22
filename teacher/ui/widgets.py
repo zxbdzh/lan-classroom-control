@@ -15,6 +15,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -173,6 +174,7 @@ class DeviceNameWidget(QWidget):
 
 class SeatTile(QFrame):
     clicked = pyqtSignal(str, bool)
+    selection_requested = pyqtSignal(str)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
 
@@ -189,6 +191,14 @@ class SeatTile(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
         top = QHBoxLayout()
+        self.selection_box = QCheckBox("选")
+        self.selection_box.setFixedWidth(28)
+        self.selection_box.setFocusPolicy(Qt.NoFocus)
+        self.selection_box.setToolTip("选择此设备；也可 Ctrl+点击卡片多选")
+        self.selection_box.setAccessibleName(f"选择设备 {device.hostname}")
+        self.selection_box.clicked.connect(
+            lambda _checked: self.selection_requested.emit(self.device.device_id)
+        )
         self.name = DeviceNameWidget(device)
         self.name.copy_requested.connect(self.copy_requested.emit)
         self.name.note_requested.connect(self.note_requested.emit)
@@ -196,6 +206,7 @@ class SeatTile(QFrame):
         self.dot.setStyleSheet(
             "color: #16836B;" if device.online else "color: #98A2B3;"
         )
+        top.addWidget(self.selection_box)
         top.addWidget(self.name, 1)
         top.addWidget(self.dot)
         layout.addLayout(top)
@@ -206,6 +217,7 @@ class SeatTile(QFrame):
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", bool(selected))
+        self.selection_box.setChecked(bool(selected))
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -296,6 +308,9 @@ class SeatMapWidget(QScrollArea):
                 widget = SeatTile(device)
                 widget.set_selected(device.device_id in self.selected)
                 widget.clicked.connect(self._select)
+                widget.selection_requested.connect(
+                    lambda device_id: self._select(device_id, True)
+                )
                 widget.copy_requested.connect(self.copy_requested.emit)
                 widget.note_requested.connect(self.note_requested.emit)
             self.grid.addWidget(widget, row + 1, column)
@@ -367,7 +382,18 @@ class PatrolCard(QFrame):
         self.name = DeviceNameWidget(device, dark=True)
         self.name.copy_requested.connect(self.copy_requested.emit)
         self.name.note_requested.connect(self.note_requested.emit)
-        footer_layout.addWidget(self.name)
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 0, 0, 0)
+        footer_row.setSpacing(8)
+        footer_row.addWidget(self.name, 1)
+        self.open_button = QPushButton("打开画面")
+        self.open_button.setProperty("compact", True)
+        self.open_button.setToolTip("打开该学生设备的巡视画面")
+        self.open_button.clicked.connect(
+            lambda: self.opened.emit(self.device.device_id)
+        )
+        footer_row.addWidget(self.open_button)
+        footer_layout.addLayout(footer_row)
         layout.addWidget(self.image, 1)
         layout.addWidget(footer)
 
