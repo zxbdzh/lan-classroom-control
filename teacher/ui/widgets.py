@@ -216,8 +216,8 @@ class SeatTile(DeviceCard):
         layout.setSpacing(4)
         top = QHBoxLayout()
         self.name = DeviceNameWidget(device)
-        self.name.copy_requested.connect(self.copy_requested.emit)
-        self.name.note_requested.connect(self.note_requested.emit)
+        self.name.copy_requested.connect(self.copy_requested)
+        self.name.note_requested.connect(self.note_requested)
         self.dot = QLabel("●")
         self.dot.setStyleSheet(
             "color: #16836B;" if device.online else "color: #98A2B3;"
@@ -304,8 +304,11 @@ class SeatMapWidget(QScrollArea):
     def _render(self) -> None:
         while self.grid.count():
             item = self.grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            old = item.widget()
+            if old is not None:
+                old.hide()
+                old.setParent(None)
+                old.deleteLater()
         lectern = QLabel("讲台  ·  教师端")
         lectern.setObjectName("Lectern")
         lectern.setAlignment(Qt.AlignCenter)
@@ -322,9 +325,9 @@ class SeatMapWidget(QScrollArea):
                 widget.set_selected(device.device_id in self.selected)
                 widget.clicked.connect(self._select)
                 widget.toggle_requested.connect(lambda key: self._select(key, True))
-                widget.menu_requested.connect(self.menu_requested.emit)
-                widget.copy_requested.connect(self.copy_requested.emit)
-                widget.note_requested.connect(self.note_requested.emit)
+                widget.menu_requested.connect(self.menu_requested)
+                widget.copy_requested.connect(self.copy_requested)
+                widget.note_requested.connect(self.note_requested)
             self.grid.addWidget(widget, row + 1, column)
         row_count = (capacity + self.columns - 1) // self.columns
         self.grid.setRowStretch(row_count + 1, 1)
@@ -431,8 +434,8 @@ class PatrolCard(DeviceCard):
         footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(9, 7, 9, 7)
         self.name = DeviceNameWidget(device, dark=True)
-        self.name.copy_requested.connect(self.copy_requested.emit)
-        self.name.note_requested.connect(self.note_requested.emit)
+        self.name.copy_requested.connect(self.copy_requested)
+        self.name.note_requested.connect(self.note_requested)
         footer_row = QHBoxLayout()
         footer_row.setContentsMargins(0, 0, 0, 0)
         footer_row.setSpacing(8)

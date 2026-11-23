@@ -776,10 +776,12 @@ def test_confirmation_lists_devices_and_defaults_to_cancel(file_drop_window):
     window = file_drop_window
     def dismiss():
         dialog = QApplication.activeModalWidget()
-        assert "黑屏肃静" in dialog.text()
-        assert "PC-02" in dialog.informativeText()
-        assert "PC-01" not in dialog.informativeText()
-        assert dialog.defaultButton() == dialog.button(QMessageBox.No)
-        dialog.button(QMessageBox.No).click()
+        from PyQt5.QtWidgets import QListWidget, QDialogButtonBox
+        assert dialog.windowTitle() == "黑屏肃静"
+        roster = dialog.findChild(QListWidget)
+        assert roster.count() == 1 and "PC-02" in roster.item(0).text()
+        cancel = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Cancel)
+        assert cancel.isDefault()
+        cancel.click()
     QTimer.singleShot(0, dismiss)
     assert not _real_target_confirmation(window, "黑屏肃静", ["pc-02"])

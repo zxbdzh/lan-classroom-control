@@ -18,6 +18,8 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QListWidget,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -690,14 +692,27 @@ class TeacherMainWindow(QMainWindow):
         if not ids:
             raise ValueError("当前范围没有设备")
         names = self._target_names(ids)
-        dialog = QMessageBox(QMessageBox.Question, action, f"对以下 {len(ids)} 台设备执行“{action}”？",
-                             QMessageBox.Yes | QMessageBox.No, self)
-        dialog.setTextFormat(Qt.PlainText)
-        dialog.setInformativeText("\n".join(names[:5]) + ("\n…" if len(names) > 5 else ""))
-        if len(names) > 5:
-            dialog.setDetailedText("\n".join(names))
-        dialog.setDefaultButton(QMessageBox.No)
-        return dialog.exec_() == QMessageBox.Yes
+        dialog = QDialog(self)
+        dialog.setWindowTitle(action)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"对以下 {len(ids)} 台设备执行“{action}”？"))
+        roster = QListWidget()
+        roster.addItems(names)
+        layout.addWidget(roster)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确认执行")
+        buttons.button(QDialogButtonBox.Ok).setAutoDefault(False)
+        cancel = buttons.button(QDialogButtonBox.Cancel)
+        cancel.setText("取消")
+        cancel.setDefault(True)
+        cancel.setFocus()
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(480, min(420, 135 + 30 * len(ids)))
+        accepted = dialog.exec_() == QDialog.Accepted
+        dialog.deleteLater()
+        return accepted
 
     def _current_scope(self):
         if self.scope_buttons["all"].isChecked():
