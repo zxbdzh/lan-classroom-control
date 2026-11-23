@@ -18,6 +18,13 @@ from teacher.ui.widgets import DeviceNameWidget, EmptySeat, FullScreenViewer, Se
 from student.ui.overlay import OverlayWindow
 
 
+_real_target_confirmation = TeacherMainWindow._confirm_targets
+
+@pytest.fixture(autouse=True)
+def accept_scoped_operations(monkeypatch):
+    monkeypatch.setattr(TeacherMainWindow, "_confirm_targets", lambda self, action, ids: True)
+
+
 @pytest.fixture
 def file_drop_window(qtbot):
     transport = InMemoryTransport()
@@ -363,6 +370,10 @@ def test_patrol_drag_and_click_scope_commands(file_drop_window, qtbot):
     cards = [window._patrol_cards[k] for k in ("pc-01", "pc-02")]
     qtbot.mouseClick(cards[1].image, Qt.LeftButton)
     assert window._current_scope() == DeviceIds(["pc-02"])
+    with patch.object(window, "_confirm_targets", return_value=False) as confirm:
+        window._start_silence()
+        confirm.assert_called_once_with("黑屏肃静", ["pc-02"])
+        assert not window.runtime.snapshot().operations
     window._start_silence()
     assert window.runtime.snapshot().operations[-1].target_ids == ("pc-02",)
     qtbot.mousePress(canvas, Qt.LeftButton, pos=cards[1].geometry().center())
@@ -389,16 +400,17 @@ def test_power_buttons_confirm_current_scope_without_slot_errors(qtbot, label, k
     qtbot.addWidget(window)
     window.show()
     window._show_page("maintenance")
+    window.scope_buttons["all"].setChecked(True)
     button = next(item for item in window.findChildren(QPushButton) if item.text() == label)
 
-    with patch("teacher.ui.main_window.QMessageBox.question", return_value=answer) as confirm:
+    with patch.object(window, "_confirm_targets", return_value=answer == QMessageBox.Yes) as confirm:
         with qtbot.captureExceptions() as exceptions:
             qtbot.mouseClick(button, Qt.LeftButton)
         assert not exceptions
 
-    confirm.assert_called_once_with(window, label, f"确定对当前作用域执行{label}？")
+    confirm.assert_called_once_with(label, window._resolve_scope_ids(window._current_scope()))
     if answer == QMessageBox.Yes:
-        runtime.power.assert_called_once_with(window._current_scope(), kind)
+        runtime.power.assert_called_once_with(DeviceIds(window._resolve_scope_ids(window._current_scope())), kind)
     else:
         runtime.power.assert_not_called()
     window.close()
@@ -741,3 +753,33 @@ def test_device_menu_uses_clicked_seat_and_preserves_multi_selection(file_drop_w
         pos = card.rect().center()
         QApplication.sendEvent(card, QContextMenuEvent(QContextMenuEvent.Mouse, pos, card.mapToGlobal(pos)))
         assert window.runtime.snapshot().operations[-1].target_ids == expected
+
+
+def test_views_share_unlabelled_checks_and_preview_starts_once(file_drop_window, qtbot):
+    window = file_drop_window
+    window._auto_preview = True
+    window._last_revision = -1
+    window._poll_runtime()
+    window._poll_runtime()
+    assert [item.envelope.action for item in window.runtime.server.sent_to("pc-01")] == ["inspection.open"]
+    window._show_page("inspection")
+    qtbot.mouseClick(window._patrol_cards["pc-02"].check, Qt.LeftButton)
+    window.view_switch.setCurrentIndex(1)
+    tile = next(t for t in window.seat_map.findChildren(SeatTile) if t.device.device_id == "pc-02")
+    assert tile.check.isChecked() and not tile.check.text()
+    assert "PC-02" in window.target_summary.text()
+    qtbot.mouseClick(tile.check, Qt.LeftButton)
+    assert not window._patrol_cards["pc-02"].check.isChecked()
+
+def test_confirmation_lists_devices_and_defaults_to_cancel(file_drop_window):
+    from PyQt5.QtCore import QTimer
+    window = file_drop_window
+    def dismiss():
+        dialog = QApplication.activeModalWidget()
+        assert "黑屏肃静" in dialog.text()
+        assert "PC-02" in dialog.informativeText()
+        assert "PC-01" not in dialog.informativeText()
+        assert dialog.defaultButton() == dialog.button(QMessageBox.No)
+        dialog.button(QMessageBox.No).click()
+    QTimer.singleShot(0, dismiss)
+    assert not _real_target_confirmation(window, "黑屏肃静", ["pc-02"])

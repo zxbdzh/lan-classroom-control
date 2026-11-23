@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QAbstractButton,
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -176,6 +177,21 @@ class DeviceNameWidget(QWidget):
 class DeviceCard(QFrame):
     menu_requested = pyqtSignal(str, QPoint)
 
+    toggle_requested = pyqtSignal(str)
+
+    def make_check(self, device):
+        self.check = QCheckBox()
+        self.check.setAccessibleName(f"选择 {device.hostname}")
+        self.check.setToolTip(f"选择或取消选择 {device.hostname}")
+        self.check.clicked.connect(lambda: self.toggle_requested.emit(device.device_id))
+        return self.check
+
+    def set_selected(self, selected: bool) -> None:
+        self.check.setChecked(selected)
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
     def contextMenuEvent(self, event):
         self.menu_requested.emit(self.device.device_id, event.globalPos())
         event.accept()
@@ -212,12 +228,10 @@ class SeatTile(DeviceCard):
         meta = device.metadata or {}
         self.detail = QLabel(str(meta.get("ip") or "未连接"))
         self.detail.setProperty("muted", True)
-        layout.addWidget(self.detail)
-
-    def set_selected(self, selected: bool) -> None:
-        self.setProperty("selected", bool(selected))
-        self.style().unpolish(self)
-        self.style().polish(self)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.make_check(device))
+        bottom.addWidget(self.detail, 1)
+        layout.addLayout(bottom)
 
     def mousePressEvent(self, event) -> None:
         self._press_pos = event.pos()
@@ -307,6 +321,7 @@ class SeatMapWidget(QScrollArea):
                 widget = SeatTile(device)
                 widget.set_selected(device.device_id in self.selected)
                 widget.clicked.connect(self._select)
+                widget.toggle_requested.connect(lambda key: self._select(key, True))
                 widget.menu_requested.connect(self.menu_requested.emit)
                 widget.copy_requested.connect(self.copy_requested.emit)
                 widget.note_requested.connect(self.note_requested.emit)
@@ -421,6 +436,7 @@ class PatrolCard(DeviceCard):
         footer_row = QHBoxLayout()
         footer_row.setContentsMargins(0, 0, 0, 0)
         footer_row.setSpacing(8)
+        footer_row.addWidget(self.make_check(device))
         footer_row.addWidget(self.name, 1)
         self.open_button = QPushButton("打开画面")
         self.open_button.setProperty("compact", True)

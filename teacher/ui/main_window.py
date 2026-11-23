@@ -77,7 +77,6 @@ class UiBridge(QObject):
 
 class TeacherMainWindow(QMainWindow):
     NAV_ITEMS = (
-        ("教室", "classroom"),
         ("巡视", "inspection"),
         ("文件", "files"),
         ("应用策略", "policies"),
@@ -102,13 +101,16 @@ class TeacherMainWindow(QMainWindow):
         self._process_command_id = None
         self._processes: List[dict] = []
         self._network_command_id = None
-        self._active_page = "classroom"
+        self._active_page = "inspection"
+        self._auto_preview = auto_start
+        self._preview_seen = set()
         self.bridge = UiBridge()
 
         self.setWindowTitle("局域网机房控制系统 · 教师端")
         self.setMinimumSize(1000, 600)
         self.resize(1440, 860)
         self._build_ui()
+        self._show_page("inspection")
         self._connect_runtime()
         self.apply_theme(str(self.config.get("ui.theme", "light")))
 
@@ -137,6 +139,19 @@ class TeacherMainWindow(QMainWindow):
         work_layout.setContentsMargins(0, 0, 0, 0)
         work_layout.setSpacing(0)
         work_layout.addWidget(self._build_command_bar())
+        summary = QHBoxLayout()
+        summary.setContentsMargins(18, 3, 18, 3)
+        self.view_switch = QComboBox()
+        self.view_switch.addItem("屏幕视图", "inspection")
+        self.view_switch.addItem("IP 座位视图", "classroom")
+        self.view_switch.currentIndexChanged.connect(lambda: self._show_page(self.view_switch.currentData()))
+        summary.addWidget(self.view_switch)
+        self.target_summary = QPushButton("已选 0 台")
+        self.target_summary.setProperty("compact", True)
+        self.target_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.target_summary.clicked.connect(self._show_targets)
+        summary.addWidget(self.target_summary, 1)
+        work_layout.addLayout(summary)
         self.pages = QStackedWidget()
         self.page_indexes = {}
         builders = {
@@ -157,7 +172,7 @@ class TeacherMainWindow(QMainWindow):
 
         status = QStatusBar()
         self.connection_status = QLabel("0 台在线")
-        self.scope_status = QLabel("作用域：全班")
+        self.scope_status = QLabel("作用域：已选 0 台")
         self.operation_status = QLabel("就绪")
         self.operation_status.setProperty("muted", True)
         status.addWidget(self.connection_status)
@@ -216,7 +231,7 @@ class TeacherMainWindow(QMainWindow):
             self.scope_group.addButton(button)
             self.scope_buttons[key] = button
             layout.addWidget(button)
-        self.scope_buttons["all"].setChecked(True)
+        self.scope_buttons["selected"].setChecked(True)
         self.group_combo = QComboBox()
         self.group_combo.setFixedWidth(120)
         self.group_combo.setVisible(False)
@@ -635,6 +650,11 @@ class TeacherMainWindow(QMainWindow):
 
     def _show_page(self, key: str) -> None:
         self._active_page = key
+        self.view_switch.setVisible(key in {"inspection", "classroom"})
+        if key in {"inspection", "classroom"}:
+            self.view_switch.blockSignals(True)
+            self.view_switch.setCurrentIndex(self.view_switch.findData(key))
+            self.view_switch.blockSignals(False)
         self.pages.setCurrentIndex(self.page_indexes[key])
         if key == "inspection":
             self._refresh_patrol()
@@ -649,6 +669,35 @@ class TeacherMainWindow(QMainWindow):
         else:
             label = f"已选 {len(self._selected_ids)} 台"
         self.scope_status.setText(f"作用域：{label}")
+        names = self._target_names(sorted(self._selected_ids))
+        self.target_summary.setText(f"已选 {len(names)} 台  " + "、".join(names[:2]) + (" …" if len(names) > 2 else ""))
+        self.target_summary.setToolTip("\n".join(names))
+
+    def _target_names(self, ids):
+        devices = {item.device_id: item for item in self._snapshot.devices} if self._snapshot else {}
+        labels = []
+        for key in ids:
+            device = devices.get(key)
+            if device:
+                address = device.metadata.get("ip", "")
+                labels.append("  ".join(filter(None, (device.hostname, address, device.note, device.metadata.get("mac")))))
+        return labels
+
+    def _show_targets(self):
+        QMessageBox.information(self, "已选设备", "\n".join(self._target_names(sorted(self._selected_ids))) or "尚未选择设备")
+
+    def _confirm_targets(self, action, ids):
+        if not ids:
+            raise ValueError("当前范围没有设备")
+        names = self._target_names(ids)
+        dialog = QMessageBox(QMessageBox.Question, action, f"对以下 {len(ids)} 台设备执行“{action}”？",
+                             QMessageBox.Yes | QMessageBox.No, self)
+        dialog.setTextFormat(Qt.PlainText)
+        dialog.setInformativeText("\n".join(names[:5]) + ("\n…" if len(names) > 5 else ""))
+        if len(names) > 5:
+            dialog.setDetailedText("\n".join(names))
+        dialog.setDefaultButton(QMessageBox.No)
+        return dialog.exec_() == QMessageBox.Yes
 
     def _current_scope(self):
         if self.scope_buttons["all"].isChecked():
@@ -662,9 +711,12 @@ class TeacherMainWindow(QMainWindow):
             raise ValueError("请先选择学生设备")
         return TargetScope.devices(sorted(self._selected_ids))
 
-    def _submit(self, callback, success_text: str):
+    def _submit(self, callback, success_text: str, action: str):
         try:
-            receipt = callback(self._current_scope())
+            ids = self._resolve_scope_ids(self._current_scope())
+            if not self._confirm_targets(action, ids):
+                return None
+            receipt = callback(DeviceIds(ids))
             self.operation_status.setText(f"{success_text} · {len(receipt.target_ids)} 台")
             self._last_revision = -1
             return receipt
@@ -673,10 +725,10 @@ class TeacherMainWindow(QMainWindow):
             return None
 
     def _start_broadcast(self) -> None:
-        self._submit(self.runtime.start_broadcast, "广播已下发")
+        self._submit(self.runtime.start_broadcast, "广播已下发", "开始广播")
 
     def _stop_broadcast(self) -> None:
-        self._submit(self.runtime.stop_broadcast, "广播已停止")
+        self._submit(self.runtime.stop_broadcast, "广播已停止", "停止广播")
 
     def _start_silence(self) -> None:
         message = str(
@@ -684,14 +736,14 @@ class TeacherMainWindow(QMainWindow):
         ).strip()
         self._submit(
             lambda scope: self.runtime.set_silence(scope, True, message),
-            "肃静已下发",
+            "肃静已下发", "黑屏肃静",
         )
 
     def _block_network(self) -> None:
         cidrs = [item.strip() for item in self.config.get("teacher.internal_cidrs", []) if item.strip()]
         receipt = self._submit(
             lambda scope: self.runtime.set_network_blocked(scope, True, cidrs),
-            "外网限制已下发，等待学生确认",
+            "外网限制已下发，等待学生确认", "禁止外网",
         )
         if receipt is not None:
             self._network_command_id = receipt.command_id
@@ -727,21 +779,22 @@ class TeacherMainWindow(QMainWindow):
         self._submit(
             lambda scope: self.runtime.set_usb_storage_blocked(scope, enabled),
             "USB 存储限制已下发" if enabled else "USB 存储恢复已下发",
+            "限制 USB 存储" if enabled else "恢复 USB 存储",
         )
 
     def _restore_all(self) -> None:
-        self._submit(self.runtime.restore_all, "临时控制已恢复")
+        self._submit(self.runtime.restore_all, "临时控制已恢复", "全部恢复")
 
     def _start_inspection(self) -> None:
         session = self._submit(
             lambda scope: self.runtime.open_inspection(scope, InspectionMode.THUMBNAIL),
-            "巡视已开始",
+            "巡视已开始", "开始巡视",
         )
         if session is not None:
             self._patrol_target_ids.update(session.target_ids)
 
     def _stop_inspection(self) -> None:
-        receipt = self._submit(self.runtime.close_inspection, "巡视已停止")
+        receipt = self._submit(self.runtime.close_inspection, "巡视已停止", "停止巡视")
         if receipt is not None:
             self._patrol_target_ids.difference_update(receipt.target_ids)
 
@@ -757,6 +810,17 @@ class TeacherMainWindow(QMainWindow):
             self._snapshot = snapshot
             self._last_revision = snapshot.revision
             self._refresh_devices()
+            if self._auto_preview:
+                online = {d.device_id for d in snapshot.devices if d.online}
+                self._preview_seen.intersection_update(online)
+                fresh = online - self._preview_seen - set(self._viewers) - set(self.runtime.remote_windows.sessions)
+                if fresh:
+                    self._preview_seen.update(fresh)
+                    try:
+                        session = self.runtime.open_inspection(DeviceIds(sorted(fresh)), InspectionMode.THUMBNAIL)
+                        self._patrol_target_ids.update(session.target_ids)
+                    except Exception as exc:
+                        self.operation_status.setText(f"自动巡视失败：{exc}")
             self.operation_drawer.set_operations(snapshot.operations)
             self._refresh_audit(snapshot.operations)
             self._consume_process_result(snapshot)
@@ -797,6 +861,7 @@ class TeacherMainWindow(QMainWindow):
             self.seat_map.selected = set(self._selected_ids)
             self.seat_map.set_devices(devices, positions)
             self._refresh_patrol()
+        self._scope_changed()
         online = sum(1 for item in self._snapshot.devices if item.online)
         self.connection_status.setText(f"{online}/{len(self._snapshot.devices)} 台在线")
         groups = sorted({item.group for item in self._snapshot.devices if item.group})
@@ -815,9 +880,7 @@ class TeacherMainWindow(QMainWindow):
         for tile in self.seat_map.canvas.findChildren(SeatTile):
             tile.set_selected(tile.device.device_id in self._selected_ids)
         for identity, card in self._patrol_cards.items():
-            card.setProperty("selected", identity in self._selected_ids)
-            card.style().unpolish(card)
-            card.style().polish(card)
+            card.set_selected(identity in self._selected_ids)
         self.scope_buttons["selected"].setChecked(True)
         self._scope_changed()
 
@@ -839,7 +902,7 @@ class TeacherMainWindow(QMainWindow):
             ("设置分组", self._set_selected_group),
             ("开始广播", self._start_broadcast), ("停止广播", self._stop_broadcast),
             ("黑屏肃静", self._start_silence),
-            ("解除黑屏", lambda: self._submit(lambda scope: self.runtime.set_silence(scope, False), "解除黑屏已下发")),
+            ("解除黑屏", lambda: self._submit(lambda scope: self.runtime.set_silence(scope, False), "解除黑屏已下发", "解除黑屏")),
         ):
             menu.addAction(label, callback)
         menu.addSection(device.hostname)
@@ -900,12 +963,13 @@ class TeacherMainWindow(QMainWindow):
         if not self._selected_ids:
             QMessageBox.warning(self, "无法分组", "请先选择学生设备")
             return
-        group, accepted = QInputDialog.getText(self, "设置分组", "分组名称：")
+        targets = sorted(self._selected_ids)
+        group, accepted = QInputDialog.getText(self, "设置分组", f"为已选 {len(targets)} 台设备设置分组名称：")
         group = group.strip()
         if not accepted or not group:
             return
         try:
-            changed = self.runtime.set_group(sorted(self._selected_ids), group)
+            changed = self.runtime.set_group(targets, group)
             self.operation_status.setText(f"已将 {changed} 台设备移入 {group}")
             self._last_revision = -1
         except Exception as exc:
@@ -921,7 +985,8 @@ class TeacherMainWindow(QMainWindow):
             return
         for index, device in enumerate(self._snapshot.devices):
             card = PatrolCard(device)
-            card.setProperty("selected", device.device_id in self._selected_ids)
+            card.set_selected(device.device_id in self._selected_ids)
+            card.toggle_requested.connect(lambda key: self._patrol_selection((key,), True))
             card.menu_requested.connect(self._device_menu)
             card.opened.connect(self._open_viewer)
             card.copy_requested.connect(self._copy_device_name)
@@ -954,6 +1019,14 @@ class TeacherMainWindow(QMainWindow):
     def _remote_toggled(self, device_id: str, enabled: bool) -> None:
         try:
             if enabled:
+                if not self._confirm_targets("远程控制", [device_id]):
+                    viewer = self._viewers.get(device_id)
+                    if viewer:
+                        viewer.remote_enabled = False
+                        viewer.remote_button.blockSignals(True)
+                        viewer.remote_button.setChecked(False)
+                        viewer.remote_button.blockSignals(False)
+                    return
                 self.runtime.start_remote_control(device_id)
                 viewer = self._viewers.get(device_id)
                 if viewer:
@@ -1041,6 +1114,8 @@ class TeacherMainWindow(QMainWindow):
         try:
             scope = self._current_scope()
             target_ids = self._resolve_scope_ids(scope)
+            if not self._confirm_targets("分发文件", target_ids):
+                return
         except Exception as exc:
             QMessageBox.warning(self, "无法分发", str(exc))
             return
@@ -1211,7 +1286,10 @@ class TeacherMainWindow(QMainWindow):
                 scope = self._current_scope()
                 if not self._resolve_scope_ids(scope):
                     raise ValueError("当前作用域没有设备，请先选择设备或使用全班规则")
-                receipt = self.runtime.set_blacklist(scope, program, "", True)
+                ids = self._resolve_scope_ids(scope)
+                if not self._confirm_targets(f"禁用 {program}", ids):
+                    return
+                receipt = self.runtime.set_blacklist(DeviceIds(ids), program, "", True)
                 message = f"{program} 禁用指令已向 {len(receipt.target_ids)} 台设备下发。"
             if not self.runtime.snapshot().application_control_enabled:
                 message = f"{program} 规则已保存，软件禁用已暂停，开启总开关后生效。"
@@ -1276,17 +1354,18 @@ class TeacherMainWindow(QMainWindow):
     def _power(self, kind: CommandKind) -> None:
         names = {CommandKind.POWER_OFF: "关机", CommandKind.REBOOT: "重启", CommandKind.LOGOFF: "注销"}
         try:
-            scope = self._current_scope()
+            ids = self._resolve_scope_ids(self._current_scope())
+            if self._confirm_targets(names[kind], ids):
+                self.runtime.power(DeviceIds(ids), kind)
         except Exception as exc:
             QMessageBox.warning(self, "无法执行", str(exc))
-            return
-        if QMessageBox.question(self, names[kind], f"确定对当前作用域执行{names[kind]}？") != QMessageBox.Yes:
-            return
-        self.runtime.power(scope, kind)
 
     def _wake(self) -> None:
         try:
-            results = self.runtime.wake(self._current_scope())
+            ids = self._resolve_scope_ids(self._current_scope())
+            if not self._confirm_targets("网络唤醒", ids):
+                return
+            results = self.runtime.wake(DeviceIds(ids))
             sent = sum(bool(result and result.success) for result in results.values())
             self.operation_status.setText(f"网络唤醒已发送 · {sent}/{len(results)} 台")
         except Exception as exc:
@@ -1300,6 +1379,8 @@ class TeacherMainWindow(QMainWindow):
             with open(path + ".manifest.json", "r", encoding="utf-8") as handle:
                 version = str(json.load(handle)["version"])
             target_ids = self._resolve_scope_ids(self._current_scope())
+            if not self._confirm_targets("部署签名更新", target_ids):
+                return
             count = self.runtime.server.push_update(path, version, target_ids)
             if count <= 0:
                 raise ValueError("更新包签名无效，或当前作用域没有在线设备")
