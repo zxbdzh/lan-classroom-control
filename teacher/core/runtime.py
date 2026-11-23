@@ -169,13 +169,9 @@ class TeacherRuntime:
         lock_input: bool = True,
     ):
         requested_ids = set(self._resolve_target_ids(scope))
-        stale_ids = self._broadcast_target_ids - requested_ids
-        if stale_ids:
-            self.submit(
-                ClassroomAction(CommandKind.BROADCAST_STOP),
-                DeviceIds(sorted(stale_ids)),
-            )
-        session_id = str(uuid.uuid4())
+        if not requested_ids:
+            raise ValueError("当前范围没有设备")
+        session_id = self._broadcast_session if self._broadcast_target_ids else str(uuid.uuid4())
         source_value = dict(source or {"kind": "monitor", "index": 0})
         receipt = self.submit(
             ClassroomAction(
@@ -192,19 +188,17 @@ class TeacherRuntime:
             ),
             scope,
         )
-        self._broadcast_target_ids = set(receipt.target_ids)
-        self.broadcast_media.start(session_id, int(source_value.get("index", 0)))
+        if not self._broadcast_target_ids:
+            self.broadcast_media.start(session_id, int(source_value.get("index", 0)))
+            self._broadcast_session = session_id
+        self._broadcast_target_ids.update(receipt.target_ids)
         return receipt
 
     def stop_broadcast(self, scope: TargetScope):
-        effective_scope = (
-            DeviceIds(sorted(self._broadcast_target_ids))
-            if self._broadcast_target_ids
-            else scope
-        )
-        receipt = self.submit(ClassroomAction(CommandKind.BROADCAST_STOP), effective_scope)
-        self._broadcast_target_ids.clear()
-        self.broadcast_media.stop()
+        receipt = self.submit(ClassroomAction(CommandKind.BROADCAST_STOP), scope)
+        self._broadcast_target_ids.difference_update(receipt.target_ids)
+        if not self._broadcast_target_ids:
+            self.broadcast_media.stop()
         return receipt
 
     def restore_all(self, scope: TargetScope):

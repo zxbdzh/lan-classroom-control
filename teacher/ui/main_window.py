@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -59,8 +60,10 @@ from teacher.ui.widgets import (
     FileDropTable,
     FullScreenViewer,
     OperationDrawer,
+    PatrolCanvas,
     PatrolCard,
     SeatMapWidget,
+    SeatTile,
     ToggleSwitch,
 )
 
@@ -273,7 +276,7 @@ class TeacherMainWindow(QMainWindow):
         action_row.addWidget(search)
         action_row.addWidget(set_group)
         page, layout = self._page_shell("教室", actions)
-        hint = QLabel("点击座位卡片选择；Ctrl+点击可多选，也可使用卡片左侧的“选”框。")
+        hint = QLabel("单击座位选机，Ctrl + 单击可增减选择。")
         hint.setProperty("muted", True)
         layout.addWidget(hint)
         self.seat_map = SeatMapWidget(
@@ -281,6 +284,7 @@ class TeacherMainWindow(QMainWindow):
             int(self.config.get("ui.seat_rows", 10)),
         )
         self.seat_map.selection_changed.connect(self._selection_changed)
+        self.seat_map.menu_requested.connect(self._device_menu)
         self.seat_map.positions_changed.connect(self._save_seat_positions)
         self.seat_map.copy_requested.connect(self._copy_device_name)
         self.seat_map.note_requested.connect(self._edit_device_note)
@@ -297,12 +301,17 @@ class TeacherMainWindow(QMainWindow):
         start.clicked.connect(self._start_inspection)
         stop = QPushButton("停止巡视")
         stop.clicked.connect(self._stop_inspection)
+        group = QPushButton("设置分组")
+        group.clicked.connect(self._set_selected_group)
+        row.addWidget(group)
         row.addWidget(start)
         row.addWidget(stop)
         page, layout = self._page_shell("巡视", actions)
+        layout.addWidget(QLabel("单击画面选一台，拖动框选多台，Ctrl 可增减选择。"))
         self.patrol_scroll = QScrollArea()
         self.patrol_scroll.setWidgetResizable(True)
-        self.patrol_canvas = QWidget()
+        self.patrol_canvas = PatrolCanvas()
+        self.patrol_canvas.selection_requested.connect(self._patrol_selection)
         self.patrol_grid = QGridLayout(self.patrol_canvas)
         self.patrol_grid.setContentsMargins(0, 0, 0, 0)
         self.patrol_grid.setSpacing(12)
@@ -651,7 +660,7 @@ class TeacherMainWindow(QMainWindow):
             return TargetScope.group(group)
         if not self._selected_ids:
             raise ValueError("请先选择学生设备")
-        return TargetScope.devices(self._selected_ids)
+        return TargetScope.devices(sorted(self._selected_ids))
 
     def _submit(self, callback, success_text: str):
         try:
@@ -767,6 +776,9 @@ class TeacherMainWindow(QMainWindow):
     def _refresh_devices(self, *_args) -> None:
         if not self._snapshot:
             return
+        valid = self._selected_ids.intersection(d.device_id for d in self._snapshot.devices)
+        if valid != self._selected_ids:
+            self._selection_changed(tuple(valid))
         search = self.classroom_search.text().strip().casefold()
         devices = [
             item for item in self._snapshot.devices
@@ -777,8 +789,8 @@ class TeacherMainWindow(QMainWindow):
         signature = tuple(
             (item.device_id, item.hostname, item.note, item.online, item.group,
              str(item.metadata.get("ip", "")))
-            for item in devices
-        )
+            for item in self._snapshot.devices
+        ) + (search,)
         if signature != self._device_signature:
             self._device_signature = signature
             positions = self.config.get("ui.seat_positions", {})
@@ -799,7 +811,58 @@ class TeacherMainWindow(QMainWindow):
 
     def _selection_changed(self, device_ids: tuple) -> None:
         self._selected_ids = set(device_ids)
+        self.seat_map.selected = set(device_ids)
+        for tile in self.seat_map.canvas.findChildren(SeatTile):
+            tile.set_selected(tile.device.device_id in self._selected_ids)
+        for identity, card in self._patrol_cards.items():
+            card.setProperty("selected", identity in self._selected_ids)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        self.scope_buttons["selected"].setChecked(True)
         self._scope_changed()
+
+    def _patrol_selection(self, hits: tuple, additive: bool) -> None:
+        selected = set(hits)
+        if additive:
+            selected.symmetric_difference_update(self._selected_ids)
+        self._selection_changed(tuple(sorted(selected)))
+
+    def _device_menu(self, device_id, point) -> None:
+        device = self._snapshot.device(device_id)
+        if not device:
+            return
+        targets = self._selected_ids if device_id in self._selected_ids else {device_id}
+        self._selection_changed(tuple(targets))
+        menu = QMenu(self)
+        menu.addSection(f"已选 {len(targets)} 台")
+        for label, callback in (
+            ("设置分组", self._set_selected_group),
+            ("开始广播", self._start_broadcast), ("停止广播", self._stop_broadcast),
+            ("黑屏肃静", self._start_silence),
+            ("解除黑屏", lambda: self._submit(lambda scope: self.runtime.set_silence(scope, False), "解除黑屏已下发")),
+        ):
+            menu.addAction(label, callback)
+        menu.addSection(device.hostname)
+        menu.addAction("打开画面", lambda: self._open_viewer(device_id)).setEnabled(device.online)
+        menu.addAction("删除这台离线设备", lambda: self._forget_device(device_id)).setEnabled(not device.online)
+        menu.exec_(point)
+        menu.deleteLater()
+
+    def _forget_device(self, device_id) -> None:
+        device = self._snapshot.device(device_id)
+        if device is None or device.online:
+            return
+        details = (f"{device.hostname}  {device.note}\n"
+                   f"IP  {device.metadata.get('ip') or '未知'}   MAC  {device.metadata.get('mac') or '未知'}\n"
+                   f"最后在线  {datetime.fromtimestamp(device.last_seen):%Y-%m-%d %H:%M}")
+        if QMessageBox.question(self, "删除离线设备", f"从教师端移除 {details}？再次连接时会重新出现。") != QMessageBox.Yes:
+            return
+        try:
+            self.runtime.classroom.forget_offline_device(device_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法移除", str(exc))
+            return
+        self._poll_runtime()
 
     def _save_seat_positions(self, positions: dict) -> None:
         self.config.set("ui.seat_positions", positions)
@@ -858,6 +921,8 @@ class TeacherMainWindow(QMainWindow):
             return
         for index, device in enumerate(self._snapshot.devices):
             card = PatrolCard(device)
+            card.setProperty("selected", device.device_id in self._selected_ids)
+            card.menu_requested.connect(self._device_menu)
             card.opened.connect(self._open_viewer)
             card.copy_requested.connect(self._copy_device_name)
             card.note_requested.connect(self._edit_device_note)

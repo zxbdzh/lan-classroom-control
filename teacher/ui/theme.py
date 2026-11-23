@@ -74,6 +74,7 @@ def stylesheet(theme: str = "light") -> str:
     QFrame#SeatTile[selected="true"] { border: 2px solid %(primary)s; background: %(panel)s; }
     QFrame#SeatTile[offline="true"] { background: %(panel_alt)s; }
     QFrame#PatrolCard { background: #101318; border: 1px solid %(line)s; border-radius: 5px; }
+    QFrame#PatrolCard[selected="true"] { border: 4px solid %(primary)s; }
     QFrame#EmptySeat { border: 1px dashed %(line)s; border-radius: 5px; background: transparent; }
     QLineEdit, QComboBox, QSpinBox, QTextEdit, QTableWidget, QListWidget {
         background: %(panel)s; color: %(ink)s; border: 1px solid %(line)s;

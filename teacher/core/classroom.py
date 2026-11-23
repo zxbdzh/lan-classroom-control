@@ -312,6 +312,11 @@ class Classroom:
             if device.online:
                 self._sync_permanent(device.device_id)
                 self._sync_global_blacklist(device.device_id)
+        # Historical seats can remain offline indefinitely. Reconcile strong matches at startup.
+        for key in sorted(self._devices, key=lambda k: (
+            self._devices[k].get("online", False), self._devices[k].get("last_seen", 0)
+        ), reverse=True):
+            self.consolidate_duplicate_devices(key, strong_only=True)
         self._persist()
 
     def submit(self, action: ClassroomAction, scope: TargetScope) -> OperationReceipt:
@@ -769,6 +774,8 @@ class Classroom:
 
     def _on_device(self, device: TransportDevice) -> None:
         with self._lock:
+            if not device.online and device.device_id not in self._devices:
+                return
             was_online = bool(self._devices.get(device.device_id, {}).get("online", False))
             self._merge_device(device, notify=False)
             if device.online and not was_online:
@@ -823,7 +830,26 @@ class Classroom:
         if notify:
             self._bump_and_persist()
 
-    def consolidate_duplicate_devices(self, canonical_id: str) -> Tuple[str, ...]:
+    def forget_offline_device(self, device_id: str) -> None:
+        with self._lock:
+            device = self._devices.get(device_id)
+            if device is None or device.get("online"):
+                raise ValueError("设备已上线或已移除，请刷新后重试")
+            ids = {key for key in self._devices if self.resolve_device_alias(key) == device_id}
+            for key in ids:
+                self._devices.pop(key, None)
+                self._desired.pop(key, None)
+                self._actual.pop(key, None)
+            self._current = {key: val for key, val in self._current.items() if key[0] not in ids}
+            for rule, targets in list(self._local_blacklist_rules.items()):
+                remaining = [key for key in targets if key not in ids]
+                if remaining:
+                    self._local_blacklist_rules[rule] = remaining
+                else:
+                    del self._local_blacklist_rules[rule]
+            self._bump_and_persist()
+
+    def consolidate_duplicate_devices(self, canonical_id: str, strong_only: bool = False) -> Tuple[str, ...]:
         with self._lock:
             self._ensure_open()
             canonical = self._devices.get(canonical_id)
@@ -838,7 +864,16 @@ class Classroom:
                 other = device.get("metadata", {})
                 if device_id == canonical_id or device.get("online") or other.get("identity_alias_of"):
                     continue
-                if normalize_mac(other.get("mac")) != mac or device.get("hostname") != canonical.get("hostname"):
+                same_hardware = bool(metadata.get("machine_id") and metadata["machine_id"] == other.get("machine_id"))
+                same_mac = normalize_mac(other.get("mac")) == mac
+                same_address = bool(metadata.get("ip") and metadata["ip"] == other.get("ip"))
+                if strong_only and not same_hardware:
+                    continue
+                if any(device_id in targets for targets in self._local_blacklist_rules.values()):
+                    continue
+                if device.get("hostname") != canonical.get("hostname"):
+                    continue
+                if not (same_mac or (same_hardware and same_address)):
                     continue
                 if metadata.get("machine_id") and other.get("machine_id"):
                     if metadata["machine_id"] != other["machine_id"]:

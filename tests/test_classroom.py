@@ -621,7 +621,7 @@ def test_operation_history_prunes_after_ninety_days_but_keeps_policy(rig):
     assert snapshot.device("pc-01").expected_for("blacklist:game.exe").permanent
 
 
-def test_runtime_stops_original_broadcast_targets_when_scope_changes():
+def test_broadcast_stops_only_selected_target():
     transport = InMemoryTransport()
     transport.connect("pc-01", "PC-01")
     transport.connect("pc-02", "PC-02")
@@ -647,13 +647,14 @@ def test_runtime_stops_original_broadcast_targets_when_scope_changes():
 
     runtime.start_broadcast(DeviceIds(["pc-01"]))
 
-    assert [item.envelope.action for item in transport.sent_to("pc-02")] == [
-        CommandKind.BROADCAST_STOP.value
-    ]
+    assert not transport.sent_to("pc-02")
+    assert len(runtime.broadcast_media.started) == 1
     transport.clear_sent()
     runtime.stop_broadcast(DeviceIds(["pc-02"]))
-    assert [item.device_id for item in transport.sent] == ["pc-01"]
-    assert transport.sent[0].envelope.action == CommandKind.BROADCAST_STOP.value
+    assert [item.device_id for item in transport.sent] == ["pc-02"]
+    assert runtime.broadcast_media.stop_count == 0
+    runtime.stop_broadcast(DeviceIds(["pc-01"]))
+    assert runtime.broadcast_media.stop_count == 1
     runtime.close()
 
 
@@ -757,3 +758,37 @@ def test_archived_id_reused_by_different_hardware_is_not_hidden():
         assert len(runtime.snapshot().devices) == 2
     finally:
         runtime.close()
+
+
+def test_forget_offline_seat_preserves_audit_and_allows_reconnect(tmp_path):
+    transport = InMemoryTransport()
+    transport.connect("a", "PC")
+    db = str(tmp_path / "forget.db")
+    runtime = TeacherRuntime(server=transport, database_path=db)
+    receipt = runtime.set_silence(All(), False)
+    with pytest.raises(ValueError):
+        runtime.classroom.forget_offline_device("a")
+    transport.disconnect("a")
+    runtime.classroom.forget_offline_device("a")
+    runtime.close()
+    transport = InMemoryTransport()
+    runtime = TeacherRuntime(server=transport, database_path=db)
+    assert not runtime.snapshot().devices
+    assert runtime.snapshot().operation(receipt.command_id)
+    transport.connect("a", "PC")
+    assert runtime.snapshot().device("a").online
+    runtime.close()
+
+
+def test_startup_merges_hardware_match_but_keeps_name_and_ip_collision(tmp_path):
+    db = str(tmp_path / "history.db")
+    transport = InMemoryTransport()
+    for key, mac, hw in (("a", "001122334401", "board-1"), ("b", "001122334402", "board-1"),
+                         ("c", "001122334403", "")):
+        transport.connect(key, "PC", metadata={"mac": mac, "machine_id": hw, "ip": "192.0.2.4"})
+    runtime = TeacherRuntime(server=transport, database_path=db)
+    runtime.close()
+    runtime = TeacherRuntime(server=InMemoryTransport(), database_path=db)
+    assert len(runtime.snapshot().devices) == 2
+    assert runtime.snapshot().device("c")
+    runtime.close()

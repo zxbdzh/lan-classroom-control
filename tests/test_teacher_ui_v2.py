@@ -355,26 +355,24 @@ def test_pressing_seat_preserves_drag_source_until_mouse_release(qtbot):
     window.close()
 
 
-def test_seat_selection_checkbox_supports_explicit_single_device_selection(qtbot):
-    runtime = TeacherRuntime(database_path=":memory:")
-    runtime.classroom._on_device(TransportDevice(device_id="pc-01", hostname="PC-01"))
-    window = TeacherMainWindow(runtime=runtime, auto_start=False)
-    qtbot.addWidget(window)
-    window.show()
-    window._poll_runtime()
+def test_patrol_drag_and_click_scope_commands(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("inspection")
     QApplication.processEvents()
-    source = window.seat_map.findChild(SeatTile)
-
-    qtbot.mouseClick(source.selection_box, Qt.LeftButton)
-    assert source.selection_box.isChecked() is True
-    assert source.property("selected") is True
-    assert window._selected_ids == {"pc-01"}
-
-    qtbot.mouseClick(source.selection_box, Qt.LeftButton)
-    assert source.selection_box.isChecked() is False
-    assert source.property("selected") is False
-    assert window._selected_ids == set()
-    window.close()
+    canvas = window.patrol_canvas
+    cards = [window._patrol_cards[k] for k in ("pc-01", "pc-02")]
+    qtbot.mouseClick(cards[1].image, Qt.LeftButton)
+    assert window._current_scope() == DeviceIds(["pc-02"])
+    window._start_silence()
+    assert window.runtime.snapshot().operations[-1].target_ids == ("pc-02",)
+    qtbot.mousePress(canvas, Qt.LeftButton, pos=cards[1].geometry().center())
+    qtbot.mouseRelease(canvas, Qt.LeftButton, pos=cards[0].geometry().center())
+    assert window._current_scope() == DeviceIds(["pc-01", "pc-02"])
+    qtbot.mouseClick(cards[1].image, Qt.LeftButton, Qt.ControlModifier)
+    assert window._current_scope() == DeviceIds(["pc-01"])
+    qtbot.mouseClick(cards[0].image, Qt.LeftButton, Qt.ControlModifier)
+    with pytest.raises(ValueError):
+        window._current_scope()
 
 
 @pytest.mark.parametrize("label, kind", [
@@ -719,3 +717,27 @@ def test_application_control_switch_failure_reverts_visual_state(file_drop_windo
     assert window.application_control_switch.isChecked()
     assert window.runtime.snapshot().application_control_enabled is True
     assert "保存失败" in window.application_feedback.text()
+
+
+@pytest.mark.parametrize("page", ["inspection", "classroom"])
+def test_device_menu_uses_clicked_seat_and_preserves_multi_selection(file_drop_window, qtbot, page):
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtGui import QContextMenuEvent
+    from PyQt5.QtWidgets import QMenu
+    window = file_drop_window
+    window._show_page(page)
+    card = window._patrol_cards["pc-02"] if page == "inspection" else next(
+        tile for tile in window.seat_map.canvas.findChildren(SeatTile) if tile.device.device_id == "pc-02")
+    for previous, expected in ((("pc-01",), ("pc-02",)), (("pc-01", "pc-02"), ("pc-01", "pc-02"))):
+        window._selection_changed(previous)
+        def choose():
+            menu = QApplication.activePopupWidget()
+            assert isinstance(menu, QMenu)
+            commands = {a.text(): a for a in menu.actions()}
+            assert not commands["删除这台离线设备"].isEnabled()
+            commands["黑屏肃静"].trigger()
+            menu.close()
+        QTimer.singleShot(0, choose)
+        pos = card.rect().center()
+        QApplication.sendEvent(card, QContextMenuEvent(QContextMenuEvent.Mouse, pos, card.mapToGlobal(pos)))
+        assert window.runtime.snapshot().operations[-1].target_ids == expected

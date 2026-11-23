@@ -7,15 +7,15 @@ import re
 import time
 from typing import Callable, Dict, Iterable, List, Optional
 
-from PyQt5.QtCore import QEvent, QMimeData, QPoint, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QMimeData, QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QColor, QDrag, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont,
     QImage, QPainter, QPixmap,
 )
 from PyQt5.QtWidgets import (
+    QApplication,
     QAbstractButton,
     QAbstractItemView,
-    QCheckBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QRubberBand,
     QScrollArea,
     QSizePolicy,
     QTableWidget,
@@ -172,9 +173,16 @@ class DeviceNameWidget(QWidget):
         return super().eventFilter(watched, event)
 
 
-class SeatTile(QFrame):
+class DeviceCard(QFrame):
+    menu_requested = pyqtSignal(str, QPoint)
+
+    def contextMenuEvent(self, event):
+        self.menu_requested.emit(self.device.device_id, event.globalPos())
+        event.accept()
+
+
+class SeatTile(DeviceCard):
     clicked = pyqtSignal(str, bool)
-    selection_requested = pyqtSignal(str)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
 
@@ -191,14 +199,6 @@ class SeatTile(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
         top = QHBoxLayout()
-        self.selection_box = QCheckBox("选")
-        self.selection_box.setFixedWidth(28)
-        self.selection_box.setFocusPolicy(Qt.NoFocus)
-        self.selection_box.setToolTip("选择此设备；也可 Ctrl+点击卡片多选")
-        self.selection_box.setAccessibleName(f"选择设备 {device.hostname}")
-        self.selection_box.clicked.connect(
-            lambda _checked: self.selection_requested.emit(self.device.device_id)
-        )
         self.name = DeviceNameWidget(device)
         self.name.copy_requested.connect(self.copy_requested.emit)
         self.name.note_requested.connect(self.note_requested.emit)
@@ -206,7 +206,6 @@ class SeatTile(QFrame):
         self.dot.setStyleSheet(
             "color: #16836B;" if device.online else "color: #98A2B3;"
         )
-        top.addWidget(self.selection_box)
         top.addWidget(self.name, 1)
         top.addWidget(self.dot)
         layout.addLayout(top)
@@ -217,7 +216,6 @@ class SeatTile(QFrame):
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", bool(selected))
-        self.selection_box.setChecked(bool(selected))
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -248,6 +246,7 @@ class EmptySeat(QFrame):
 
 
 class SeatMapWidget(QScrollArea):
+    menu_requested = pyqtSignal(str, QPoint)
     selection_changed = pyqtSignal(tuple)
     positions_changed = pyqtSignal(dict)
     copy_requested = pyqtSignal(str)
@@ -308,9 +307,7 @@ class SeatMapWidget(QScrollArea):
                 widget = SeatTile(device)
                 widget.set_selected(device.device_id in self.selected)
                 widget.clicked.connect(self._select)
-                widget.selection_requested.connect(
-                    lambda device_id: self._select(device_id, True)
-                )
+                widget.menu_requested.connect(self.menu_requested.emit)
                 widget.copy_requested.connect(self.copy_requested.emit)
                 widget.note_requested.connect(self.note_requested.emit)
             self.grid.addWidget(widget, row + 1, column)
@@ -358,7 +355,46 @@ class SeatMapWidget(QScrollArea):
         event.acceptProposedAction()
 
 
-class PatrolCard(QFrame):
+class PatrolCanvas(QWidget):
+    selection_requested = pyqtSignal(tuple, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.origin = None
+        self.band = QRubberBand(QRubberBand.Rectangle, self)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self.origin = event.pos()
+        self.grabMouse()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.origin is None:
+            return super().mouseMoveEvent(event)
+        if (event.pos() - self.origin).manhattanLength() >= QApplication.startDragDistance():
+            self.band.setGeometry(QRect(self.origin, event.pos()).normalized())
+            self.band.show()
+            self.band.raise_()
+
+    def mouseReleaseEvent(self, event):
+        if self.origin is None or event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        end = event.pos()
+        dragged = (end - self.origin).manhattanLength() >= QApplication.startDragDistance()
+        area = QRect(self.origin, end).normalized() if dragged else QRect(end, QSize(1, 1))
+        self.origin = None
+        self.band.hide()
+        self.releaseMouse()
+        grid = self.layout()
+        hits = tuple(card.device.device_id for card in
+                     (grid.itemAt(i).widget() for i in range(grid.count()))
+                     if isinstance(card, PatrolCard) and area.intersects(card.geometry()))
+        self.selection_requested.emit(hits, bool(event.modifiers() & Qt.ControlModifier))
+
+
+class PatrolCard(DeviceCard):
     opened = pyqtSignal(str)
     copy_requested = pyqtSignal(str)
     note_requested = pyqtSignal(str)
