@@ -785,3 +785,45 @@ def test_confirmation_lists_devices_and_defaults_to_cancel(file_drop_window):
         cancel.click()
     QTimer.singleShot(0, dismiss)
     assert not _real_target_confirmation(window, "黑屏肃静", ["pc-02"])
+
+
+def test_patrol_refresh_checks_all_online_devices_without_confirmation(file_drop_window, qtbot):
+    window = file_drop_window
+    window._show_page("inspection")
+    window._selection_changed(("pc-01",))
+    window.runtime.server.connect("offline", "OFFLINE")
+    window.runtime.server.disconnect("offline")
+    window._poll_runtime()
+    window.runtime.server.clear_sent()
+    with patch.object(window, "_confirm_targets", side_effect=AssertionError("unexpected confirmation")):
+        start = next(b for b in window.findChildren(QPushButton) if b.text() == "开始巡视")
+        qtbot.mouseClick(start, Qt.LeftButton)
+        window.runtime.server.scan_devices.assert_called_once()
+        assert window._selected_ids == {"pc-01"}
+        operation = window.runtime.snapshot().operations[-1]
+        assert operation.action.kind == CommandKind.INSPECTION_OPEN
+        assert operation.target_ids == ("pc-01", "pc-02")
+        assert not window.runtime.server.sent_to("offline")
+
+        window.runtime.server.connect("new", "NEW")
+        window._poll_runtime()
+        assert window.runtime.server.sent_to("new")[-1].envelope.action == "inspection.open"
+        stop = next(b for b in window.findChildren(QPushButton) if b.text() == "停止巡视")
+        qtbot.mouseClick(stop, Qt.LeftButton)
+        assert window.runtime.snapshot().operations[-1].target_ids == ("new", "pc-01", "pc-02")
+        assert not window._auto_preview
+        window.runtime.server.clear_sent()
+        window.runtime.server.connect("later", "LATER")
+        window._poll_runtime()
+        assert not window.runtime.server.sent_to("later")
+
+
+def test_patrol_refresh_with_no_online_devices_still_scans(file_drop_window):
+    window = file_drop_window
+    for key in ("pc-01", "pc-02"):
+        window.runtime.server.disconnect(key)
+    with patch.object(window, "_confirm_targets", side_effect=AssertionError("unexpected confirmation")):
+        window._start_inspection()
+    window.runtime.server.scan_devices.assert_called_once()
+    assert window._auto_preview
+    assert "等待学生机连接" in window.operation_status.text()

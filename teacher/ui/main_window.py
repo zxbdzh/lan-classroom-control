@@ -820,17 +820,41 @@ class TeacherMainWindow(QMainWindow):
         )
 
     def _start_inspection(self) -> None:
-        session = self._submit(
-            lambda scope: self.runtime.open_inspection(scope, InspectionMode.THUMBNAIL),
-            "巡视已开始", "开始巡视",
-        )
-        if session is not None:
-            self._patrol_target_ids.update(session.target_ids)
+        try:
+            self.runtime.server.scan_devices()
+            snapshot = self.runtime.snapshot()
+            targets = {
+                device.device_id for device in snapshot.devices if device.online
+            } - set(self._viewers) - set(self.runtime.remote_windows.sessions)
+            if targets:
+                session = self.runtime.open_inspection(
+                    DeviceIds(sorted(targets)), InspectionMode.THUMBNAIL
+                )
+                self._patrol_target_ids.update(session.target_ids)
+            self._auto_preview = True
+            self._preview_seen.update(targets)
+            self._last_revision = -1
+            self._poll_runtime()
+            self.operation_status.setText(
+                f"已刷新设备状态，正在巡视 {len(targets)} 台在线设备"
+                if targets else "已刷新设备状态，等待学生机连接"
+            )
+        except Exception as exc:
+            self.operation_status.setText(f"巡视刷新失败：{exc}")
 
     def _stop_inspection(self) -> None:
-        receipt = self._submit(self.runtime.close_inspection, "巡视已停止", "停止巡视")
-        if receipt is not None:
-            self._patrol_target_ids.difference_update(receipt.target_ids)
+        self._auto_preview = False
+        self._preview_seen.clear()
+        targets = self._patrol_target_ids - set(self._viewers) - set(self.runtime.remote_windows.sessions)
+        try:
+            if targets:
+                receipt = self.runtime.close_inspection(DeviceIds(sorted(targets)))
+                self._patrol_target_ids.difference_update(receipt.target_ids)
+            self._patrol_target_ids.intersection_update(set(self._viewers))
+            self.operation_status.setText("巡视已停止")
+            self._last_revision = -1
+        except Exception as exc:
+            self.operation_status.setText(f"停止巡视失败：{exc}")
 
     def _poll_runtime(self) -> None:
         try:
