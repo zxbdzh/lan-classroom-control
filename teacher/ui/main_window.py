@@ -9,8 +9,8 @@ import ntpath
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from PyQt5.QtCore import QObject, QSize, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QPalette
+from PyQt5.QtCore import QObject, QPoint, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -170,6 +170,8 @@ class TeacherMainWindow(QMainWindow):
         work_layout.addWidget(self.pages, 1)
         outer.addWidget(work, 1)
         self.operation_drawer = OperationDrawer()
+        self.operation_drawer.restore_requested.connect(self._restore_all)
+        self.operation_drawer.restore_all_requested.connect(self._restore_class)
         outer.addWidget(self.operation_drawer)
 
         status = QStatusBar()
@@ -548,6 +550,10 @@ class TeacherMainWindow(QMainWindow):
         usb_hint.setProperty("muted", True)
         layout.addWidget(usb_hint)
         self.maintenance_table = self._table(("设备", "IP", "MAC", "系统", "版本", "状态", "USB 策略"))
+        self.maintenance_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.maintenance_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.maintenance_table.customContextMenuRequested.connect(self._maintenance_menu)
+        self.maintenance_table.itemSelectionChanged.connect(self._maintenance_selection_changed)
         self.maintenance_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         self.maintenance_table.setColumnWidth(0, 235)
         layout.addWidget(self.maintenance_table, 1)
@@ -588,12 +594,15 @@ class TeacherMainWindow(QMainWindow):
         self.silence_message = QLineEdit(
             str(self.config.get("teacher.silence_message", "请保持安静，注意教师屏幕"))
         )
+        self.confirm_actions = QCheckBox("执行课堂操作前显示设备确认")
+        self.confirm_actions.setChecked(bool(self.config.get("ui.confirm_actions", True)))
         fields = (
             ("界面主题", self.theme_combo),
             ("座位列数", self.seat_columns),
             ("座位行数", self.seat_rows),
             ("黑屏提示语", self.silence_message),
             ("保留内网 CIDR", self.internal_cidrs),
+            ("操作确认", self.confirm_actions),
         )
         for index, (label, widget) in enumerate(fields):
             grid.addWidget(QLabel(label), index, 0)
@@ -691,6 +700,8 @@ class TeacherMainWindow(QMainWindow):
     def _confirm_targets(self, action, ids):
         if not ids:
             raise ValueError("当前范围没有设备")
+        if not self.config.get("ui.confirm_actions", True):
+            return True
         names = self._target_names(ids)
         dialog = QDialog(self)
         dialog.setWindowTitle(action)
@@ -726,9 +737,9 @@ class TeacherMainWindow(QMainWindow):
             raise ValueError("请先选择学生设备")
         return TargetScope.devices(sorted(self._selected_ids))
 
-    def _submit(self, callback, success_text: str, action: str):
+    def _submit(self, callback, success_text: str, action: str, scope=None):
         try:
-            ids = self._resolve_scope_ids(self._current_scope())
+            ids = self._resolve_scope_ids(scope or self._current_scope())
             if not self._confirm_targets(action, ids):
                 return None
             receipt = callback(DeviceIds(ids))
@@ -799,6 +810,14 @@ class TeacherMainWindow(QMainWindow):
 
     def _restore_all(self) -> None:
         self._submit(self.runtime.restore_all, "临时控制已恢复", "全部恢复")
+
+    def _restore_class(self) -> None:
+        self._submit(
+            self.runtime.restore_all,
+            "全班临时控制已恢复",
+            "全班恢复",
+            TargetScope.all(),
+        )
 
     def _start_inspection(self) -> None:
         session = self._submit(
@@ -1432,6 +1451,7 @@ class TeacherMainWindow(QMainWindow):
         self.process_device.blockSignals(False)
         if self.process_device.currentData() != current:
             self._process_device_changed()
+        self.maintenance_table.blockSignals(True)
         self.maintenance_table.setRowCount(0)
         for device in devices:
             row = self.maintenance_table.rowCount()
@@ -1447,14 +1467,41 @@ class TeacherMainWindow(QMainWindow):
                 self.maintenance_table.setItem(row, column, QTableWidgetItem(str(value)))
             self.maintenance_table.item(row, 0).setData(Qt.UserRole, device.device_id)
             name = DeviceNameWidget(device)
-            # 单元格控件要遮住下方原始文本，避免主机名与备注叠字。
-            name.setBackgroundRole(QPalette.Base)
-            name.setAutoFillBackground(True)
             name.copy_requested.connect(self._copy_device_name)
             name.note_requested.connect(self._edit_device_note)
             self.maintenance_table.setCellWidget(row, 0, name)
             self.maintenance_table.setRowHeight(row, max(36, name.sizeHint().height() + 6))
+            if device.device_id in self._selected_ids:
+                self.maintenance_table.selectRow(row)
+        self.maintenance_table.blockSignals(False)
         self._refresh_application_rules()
+
+    def _maintenance_selection_changed(self) -> None:
+        ids = set()
+        for item in self.maintenance_table.selectedItems():
+            value = self.maintenance_table.item(item.row(), 0)
+            if value is not None:
+                device_id = value.data(Qt.UserRole)
+                if device_id:
+                    ids.add(str(device_id))
+        if ids != self._selected_ids:
+            self._selection_changed(tuple(sorted(ids)))
+
+    def _maintenance_menu(self, point: QPoint) -> None:
+        row = self.maintenance_table.rowAt(point.y())
+        if row < 0:
+            return
+        item = self.maintenance_table.item(row, 0)
+        device_id = item.data(Qt.UserRole) if item else None
+        if not device_id:
+            return
+        selected_rows = {index.row() for index in self.maintenance_table.selectionModel().selectedRows()}
+        if row not in selected_rows:
+            self.maintenance_table.clearSelection()
+            self.maintenance_table.selectRow(row)
+        self._device_menu(
+            str(device_id), self.maintenance_table.viewport().mapToGlobal(point)
+        )
 
     def _refresh_application_rules(self, *_args) -> None:
         snapshot = self._snapshot
@@ -1596,6 +1643,7 @@ class TeacherMainWindow(QMainWindow):
         self.config.set("ui.seat_rows", self.seat_rows.value())
         self.config.set("teacher.silence_message", self.silence_message.text().strip())
         self.config.set("teacher.internal_cidrs", cidrs)
+        self.config.set("ui.confirm_actions", self.confirm_actions.isChecked())
         self.config.save()
         self.seat_map.rows = self.seat_rows.value()
         self.seat_map.set_columns(self.seat_columns.value())

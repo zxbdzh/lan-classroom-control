@@ -118,6 +118,7 @@ class DeviceNameWidget(QWidget):
 
     def __init__(self, device, dark: bool = False, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("DeviceNameWidget")
         self.device_id = device.device_id
         self._hostname = device.hostname
         self.setMinimumWidth(0)
@@ -196,6 +197,17 @@ class DeviceCard(QFrame):
         self.menu_requested.emit(self.device.device_id, event.globalPos())
         event.accept()
 
+    def enable_child_context_menu(self) -> None:
+        for child in self.findChildren(QWidget):
+            child.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.ContextMenu:
+            self.menu_requested.emit(self.device.device_id, event.globalPos())
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
 
 class SeatTile(DeviceCard):
     clicked = pyqtSignal(str, bool)
@@ -232,6 +244,7 @@ class SeatTile(DeviceCard):
         bottom.addWidget(self.make_check(device))
         bottom.addWidget(self.detail, 1)
         layout.addLayout(bottom)
+        self.enable_child_context_menu()
 
     def mousePressEvent(self, event) -> None:
         self._press_pos = event.pos()
@@ -244,11 +257,12 @@ class SeatTile(DeviceCard):
             return
         if (event.pos() - self._press_pos).manhattanLength() < 10:
             return
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setText(self.device.device_id)
-        drag.setMimeData(mime)
-        drag.exec_(Qt.MoveAction)
+        canvas = self.parentWidget()
+        if isinstance(canvas, SeatMapCanvas):
+            canvas.begin_selection(
+                self.mapTo(canvas, self._press_pos), event.modifiers()
+            )
+            return
 
 
 class EmptySeat(QFrame):
@@ -275,7 +289,8 @@ class SeatMapWidget(QScrollArea):
         self.devices = []
         self.setWidgetResizable(True)
         self.setAcceptDrops(True)
-        self.canvas = QWidget()
+        self.canvas = SeatMapCanvas()
+        self.canvas.selection_requested.connect(self._select_area)
         self.grid = QGridLayout(self.canvas)
         self.grid.setContentsMargins(18, 14, 18, 24)
         self.grid.setHorizontalSpacing(12)
@@ -348,6 +363,20 @@ class SeatMapWidget(QScrollArea):
             tile.set_selected(tile.device.device_id in self.selected)
         self.selection_changed.emit(tuple(sorted(self.selected)))
 
+    def _select_area(self, area: QRect, additive: bool) -> None:
+        hits = {
+            tile.device.device_id
+            for tile in self.canvas.findChildren(SeatTile)
+            if area.intersects(tile.geometry())
+        }
+        if additive:
+            self.selected.symmetric_difference_update(hits)
+        else:
+            self.selected = hits
+        for tile in self.canvas.findChildren(SeatTile):
+            tile.set_selected(tile.device.device_id in self.selected)
+        self.selection_changed.emit(tuple(sorted(self.selected)))
+
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasText():
             event.acceptProposedAction()
@@ -412,6 +441,44 @@ class PatrolCanvas(QWidget):
         self.selection_requested.emit(hits, bool(event.modifiers() & Qt.ControlModifier))
 
 
+class SeatMapCanvas(QWidget):
+    selection_requested = pyqtSignal(QRect, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.origin = None
+        self.band = QRubberBand(QRubberBand.Rectangle, self)
+
+    def begin_selection(self, origin: QPoint, modifiers) -> None:
+        self.origin = origin
+        self.modifiers = modifiers
+        self.grabMouse()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self.begin_selection(event.pos(), event.modifiers())
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.origin is None:
+            return super().mouseMoveEvent(event)
+        area = QRect(self.origin, event.pos()).normalized()
+        if area.width() >= QApplication.startDragDistance() or area.height() >= QApplication.startDragDistance():
+            self.band.setGeometry(area)
+            self.band.show()
+            self.band.raise_()
+
+    def mouseReleaseEvent(self, event):
+        if self.origin is None or event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        area = QRect(self.origin, event.pos()).normalized()
+        self.origin = None
+        self.band.hide()
+        self.releaseMouse()
+        self.selection_requested.emit(area, bool(self.modifiers & Qt.ControlModifier))
+
+
 class PatrolCard(DeviceCard):
     opened = pyqtSignal(str)
     copy_requested = pyqtSignal(str)
@@ -430,7 +497,7 @@ class PatrolCard(DeviceCard):
         self.image.setStyleSheet("color:#98A2B3; background:#0D1117;")
         self.image.setMinimumHeight(124)
         footer = QFrame()
-        footer.setStyleSheet("background:#171C24;")
+        footer.setObjectName("PatrolFooter")
         footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(9, 7, 9, 7)
         self.name = DeviceNameWidget(device, dark=True)
@@ -451,6 +518,7 @@ class PatrolCard(DeviceCard):
         footer_layout.addLayout(footer_row)
         layout.addWidget(self.image, 1)
         layout.addWidget(footer)
+        self.enable_child_context_menu()
 
     def update_frame(self, jpeg: bytes) -> None:
         image = QImage.fromData(jpeg)
@@ -578,16 +646,30 @@ class FullScreenViewer(QDialog):
 
 
 class OperationDrawer(QWidget):
+    restore_requested = pyqtSignal()
+    restore_all_requested = pyqtSignal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("OperationDrawer")
         self.setFixedWidth(300)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 16, 14, 16)
-        header = QLabel("最近操作")
-        header.setStyleSheet("font-weight:600; font-size:15px;")
+        header = QHBoxLayout()
+        title = QLabel("最近操作")
+        title.setStyleSheet("font-weight:600; font-size:15px;")
+        current = QPushButton("当前范围恢复")
+        current.setProperty("compact", True)
+        current.clicked.connect(self.restore_requested)
+        all_devices = QPushButton("全班恢复")
+        all_devices.setProperty("compact", True)
+        all_devices.clicked.connect(self.restore_all_requested)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(current)
+        header.addWidget(all_devices)
         self.list = QListWidget()
-        layout.addWidget(header)
+        layout.addLayout(header)
         layout.addWidget(self.list, 1)
 
     def set_operations(self, operations) -> None:
@@ -618,5 +700,5 @@ class OperationDrawer(QWidget):
 
 __all__ = [
     "DeviceNameWidget", "FileDropTable", "FullScreenViewer", "OperationDrawer",
-    "PatrolCard", "SeatMapWidget", "ToggleSwitch", "hostname_order"
+    "PatrolCard", "SeatMapCanvas", "SeatMapWidget", "ToggleSwitch", "hostname_order"
 ]

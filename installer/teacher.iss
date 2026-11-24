@@ -1,7 +1,7 @@
 #define AppName "LanClassroom Teacher"
 #define AppNameZh "局域网机房控制系统教师端"
 #ifndef AppVersion
-  #define AppVersion "2.1.3"
+  #define AppVersion "2.1.4"
 #endif
 #define AppPublisher "LanClassroom"
 #define AppExeName "LanClassroom-Teacher.exe"

@@ -62,6 +62,9 @@ def stylesheet(theme: str = "light") -> str:
     QTabWidget#ApplicationTabs QTabBar::tab:selected { background: %(panel)s; color: %(primary)s;
         border-bottom: 2px solid %(primary)s; font-weight: 600; }
     QCheckBox { color: %(ink)s; spacing: 6px; background: transparent; }
+    QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid %(muted)s; border-radius: 4px; background: %(panel)s; }
+    QCheckBox::indicator:hover { border-color: %(primary)s; }
+    QCheckBox::indicator:checked { background: %(primary)s; border-color: %(primary)s; }
     QPushButton#NavButton { border: 0; border-radius: 4px; text-align: left;
         padding-left: 14px; min-height: 42px; color: %(muted)s; background: transparent; }
     QPushButton#NavButton:hover { color: %(ink)s; background: %(panel_alt)s; }
@@ -73,8 +76,11 @@ def stylesheet(theme: str = "light") -> str:
     QFrame#SeatTile { background: %(seat)s; border: 1px solid %(line)s; border-radius: 5px; }
     QFrame#SeatTile[selected="true"] { border: 2px solid %(primary)s; background: %(panel)s; }
     QFrame#SeatTile[offline="true"] { background: %(panel_alt)s; }
-    QFrame#PatrolCard { background: #101318; border: 1px solid %(line)s; border-radius: 5px; }
-    QFrame#PatrolCard[selected="true"] { border: 4px solid %(primary)s; }
+    QFrame#PatrolCard { background: %(panel)s; border: 1px solid %(line)s; border-radius: 5px; }
+    QFrame#PatrolCard[selected="true"] { border: 2px solid %(primary)s; }
+    QFrame#PatrolFooter { background: %(panel_alt)s; }
+    QWidget#DeviceNameWidget { background: transparent; }
+    QTableWidget QWidget#DeviceNameWidget { background: transparent; }
     QFrame#EmptySeat { border: 1px dashed %(line)s; border-radius: 5px; background: transparent; }
     QLineEdit, QComboBox, QSpinBox, QTextEdit, QTableWidget, QListWidget {
         background: %(panel)s; color: %(ink)s; border: 1px solid %(line)s;
@@ -84,8 +90,11 @@ def stylesheet(theme: str = "light") -> str:
         border-bottom: 1px solid %(line)s; padding: 7px; font-weight: 600; }
     QScrollArea { border: 0; background: transparent; }
     QScrollArea > QWidget > QWidget { background: transparent; }
-    QScrollBar:vertical { width: 10px; background: transparent; }
-    QScrollBar::handle:vertical { background: %(line)s; min-height: 24px; border-radius: 4px; }
+    QScrollBar:vertical { width: 10px; background: %(panel_alt)s; margin: 0; }
+    QScrollBar:horizontal { height: 10px; background: %(panel_alt)s; margin: 0; }
+    QScrollBar::handle:vertical, QScrollBar::handle:horizontal { background: %(line)s; min-height: 24px; min-width: 24px; border-radius: 4px; }
+    QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: %(muted)s; }
+    QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { background: transparent; border: 0; }
     QProgressBar { border: 0; background: %(panel_alt)s; height: 6px; border-radius: 3px; }
     QProgressBar::chunk { background: %(primary)s; border-radius: 3px; }
     QToolTip { background: %(ink)s; color: %(panel)s; border: 0; padding: 5px; }

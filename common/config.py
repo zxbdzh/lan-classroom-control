@@ -59,6 +59,7 @@ class Config:
                 "seat_rows": 10,
                 "seat_sort": "hostname_trailing_number",
                 "sidebar_collapsed": False,
+                "confirm_actions": True,
             }
         }
 
